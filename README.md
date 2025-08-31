@@ -1,6 +1,8 @@
 # CephRBDSR - Ceph RBD Storage Repository Driver for XCP-ng
 
-A production-ready SMAPIv2 storage driver that enables XCP-ng to use Ceph RADOS Block Device (RBD) images as virtual disk storage, providing distributed, scalable, and highly available block storage.
+NOTE: This code is still work in progress - don't use in production yet
+
+SMAPIv2 storage driver that enables XCP-ng to use Ceph RADOS Block Device (RBD) images as virtual disk storage, providing distributed, scalable, and highly available block storage.
 
 ## Features
 
@@ -27,7 +29,7 @@ A production-ready SMAPIv2 storage driver that enables XCP-ng to use Ceph RADOS 
 ## Requirements
 
 ### Ceph Cluster
-- **Ceph version**: Nautilus or later (tested with Nautilus/Octopus)
+- **Ceph version**: Nautilus or later (tested with Nautilus runtime (directly on XCP-ng dom0) on Octopus CEPH cluster)
 - **RBD kernel module**: Available on XCP-ng hosts
 - **Pool configuration**: Pre-configured Ceph pool for storage
 
