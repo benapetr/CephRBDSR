@@ -263,19 +263,6 @@ ceph osd pool stats rbd
 
 ## Development
 
-### Testing
-The repository includes test scripts for development:
-
-- `test_cephrbd.py` - Basic functionality tests
-- `test_quota.py` - Pool quota functionality tests  
-- `test_stats.py` - Statistics and capacity tests
-- `test_vdi_creation.py` - VDI lifecycle tests
-
-```bash
-# Run basic tests (requires Ceph access)
-python test_cephrbd.py
-```
-
 ### Code Structure
 ```
 CephRBDSR.py           # Main driver implementation
@@ -318,26 +305,11 @@ This project is licensed under the GPL v2 License - see the [LICENSE](LICENSE) f
 - **XCP-ng Forum**: Community discussions
 - **Ceph Community**: Ceph-specific questions
 
-### Commercial Support
-For production deployments requiring commercial support, consider:
-- XCP-ng Pro support
-- Ceph Enterprise support
-- Third-party integration specialists
-
 ## Acknowledgments
 
 - XCP-ng Project for the excellent hypervisor platform
 - Ceph Community for the robust distributed storage system
 - Original inspiration from other open-source SM drivers
-
-## Changelog
-
-### v1.0.0 (2024-08-31)
-- Initial release with full SMAPIv2 support
-- Pool quota support
-- XCP-ng kernel compatibility optimizations
-- Comprehensive error handling and recovery
-- Production-ready stability improvements
 
 ---
 
