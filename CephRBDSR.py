@@ -101,8 +101,8 @@ class CephRBDSR(SR.SR):
         
         # Store configuration
         self.pool = self.dconf['pool']
-        self.ceph_conf = self.dconf.get('ceph_conf', '/etc/ceph/ceph.conf')
-        self.ceph_user = self.dconf.get('ceph_user', 'admin')
+        self.ceph_conf = self.dconf.get('conf', '/etc/ceph/ceph.conf')
+        self.ceph_user = self.dconf.get('user', 'admin')
         self.keyring = self.dconf.get('keyring', '')
         self.mon_host = self.dconf.get('mon_host', '')
         
@@ -796,9 +796,14 @@ class CephRBDVDI(VDI.VDI):
     
     def snapshot(self, sr_uuid, vdi_uuid):
         """Create RBD snapshot and clone"""
-        util.SMlog("Creating CephRBD snapshot %s -> %s" % (self.uuid, vdi_uuid))
+        util.SMlog("Creating CephRBD snapshot from VDI %s" % self.uuid)
         
-        snapshot_name = "snap-%s" % vdi_uuid
+        # Generate new UUID for the snapshot/clone
+        clone_uuid = util.gen_uuid()
+        util.SMlog("Generated new UUID for snapshot: %s" % clone_uuid)
+
+        clone_name = "%s%s" % (self.sr.RBD_PREFIX, clone_uuid)
+        snapshot_name = "snap-%s" % clone_uuid
         
         try:
             # Create snapshot of current RBD image
@@ -810,7 +815,6 @@ class CephRBDVDI(VDI.VDI):
             util.pread2(cmd)
             
             # Create clone from snapshot
-            clone_name = "%s%s" % (self.sr.RBD_PREFIX, vdi_uuid)
             cmd = self.sr._build_rbd_cmd([
                 'clone', 
                 '%s@%s' % (self.rbd_name, snapshot_name),
@@ -818,26 +822,51 @@ class CephRBDVDI(VDI.VDI):
             ])
             util.pread2(cmd)
             
-            # Create snapshot VDI object
-            snapshot_vdi = self.sr.vdi(vdi_uuid)
+            # Create snapshot VDI object with the new UUID
+            snapshot_vdi = self.sr.vdi(clone_uuid)
             snapshot_vdi.size = self.size
             snapshot_vdi.vdi_type = self.vdi_type
             snapshot_vdi.utilisation = 0  # Clone is thin-provisioned
             snapshot_vdi.parent = self
             snapshot_vdi.rbd_name = clone_name
             
-            # Add to SR
-            self.sr.vdis[vdi_uuid] = snapshot_vdi
+            # Set additional VDI properties for proper database introduction
+            snapshot_vdi.location = clone_uuid
+            snapshot_vdi.read_only = False  # Clone is writable
+            snapshot_vdi.label = self.label + " (snapshot)"
+            snapshot_vdi.description = "Snapshot of " + self.description
+            snapshot_vdi.ty = "user"  # VDI type for XAPI
+            snapshot_vdi.shareable = False
+            snapshot_vdi.managed = True
+            snapshot_vdi.is_a_snapshot = False  # Clone is not a snapshot, it's a new VDI
+            snapshot_vdi.metadata_of_pool = ""
+            snapshot_vdi.snapshot_time = "19700101T00:00:00Z"
+            snapshot_vdi.snapshot_of = ""
+            snapshot_vdi.cbt_enabled = False
             
-            util.SMlog("Created RBD snapshot and clone: %s" % clone_name)
-            return snapshot_vdi
+            # Initialize sm_config
+            if not hasattr(snapshot_vdi, 'sm_config'):
+                snapshot_vdi.sm_config = {}
+            snapshot_vdi.sm_config['vdi_type'] = self.vdi_type
+            
+            # Introduce the new VDI to XAPI database
+            vdi_ref = snapshot_vdi._db_introduce()
+            util.SMlog("vdi_snapshot: introduced VDI: %s (%s)" % (vdi_ref, clone_uuid))
+            
+            # Add to SR with the new UUID
+            self.sr.vdis[clone_uuid] = snapshot_vdi
+            
+            util.SMlog("Created RBD snapshot and clone: %s (UUID: %s)" % (clone_name, clone_uuid))
+            return snapshot_vdi.get_params()
             
         except Exception as e:
             # Cleanup on failure
             try:
                 # Unprotect and remove snapshot if it was created
-                self.sr._build_rbd_cmd(['snap', 'unprotect', '%s@%s' % (self.rbd_name, snapshot_name)])
-                self.sr._build_rbd_cmd(['snap', 'rm', '%s@%s' % (self.rbd_name, snapshot_name)])
+                cmd = self.sr._build_rbd_cmd(['snap', 'unprotect', '%s@%s' % (self.rbd_name, snapshot_name)])
+                util.pread2(cmd)
+                cmd = self.sr._build_rbd_cmd(['snap', 'rm', '%s@%s' % (self.rbd_name, snapshot_name)])
+                util.pread2(cmd)
             except:
                 pass
             
