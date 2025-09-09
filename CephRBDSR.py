@@ -35,6 +35,7 @@ import time
 import subprocess
 import re
 import xmlrpclib
+import datetime
 from lock import Lock
 
 # Driver capabilities - Ceph RBD supports advanced features
@@ -58,7 +59,8 @@ CAPABILITIES = [
 CONFIGURATION = [
     ['pool', 'Ceph pool name (required)'],
     ['conf', 'Ceph configuration file path (optional, default /etc/ceph/ceph.conf)'],
-    ['user', 'Ceph user name (optional, default admin)']
+    ['user', 'Ceph user name (optional, default admin)'],
+    ['prefix', 'Prefix for RBD image names (optional)']
 ]
 
 # Driver metadata information
@@ -76,14 +78,15 @@ DRIVER_INFO = {
 # Driver-specific configuration
 DRIVER_CONFIG = {
     "ATTACH_FROM_CONFIG_WITH_TAPDISK": False,  # We use kernel RBD mapping
-    "MULTIPATH": False  # Ceph handles replication internally
+    "MULTIPATH": False  # Ceph is natively parallel
 }
 
 class CephRBDSR(SR.SR):
     """Ceph RBD Storage Repository implementation"""
     
     DRIVER_TYPE = "cephrbd"
-    RBD_PREFIX = "vdi-"  # Prefix for RBD image names
+    RBD_PREFIX = "vdi-"  # Prefix for RBD image names, there is also "conf.prefix" which is configurable and allows using same pool for multiple SRs with different prefixes
+    SNAP_PREFIX = "snap-"
     
     def handles(type):
         """Check if this driver handles the given storage type"""
@@ -96,8 +99,7 @@ class CephRBDSR(SR.SR):
         
         # Validate required configuration
         if 'pool' not in self.dconf:
-            raise xs_errors.XenError('ConfigParameterMissing',
-                                   opterr='Missing required parameter: pool')
+            raise xs_errors.XenError('ConfigParameterMissing', opterr='Missing required parameter: pool')
         
         # Store configuration
         self.pool = self.dconf['pool']
@@ -105,11 +107,11 @@ class CephRBDSR(SR.SR):
         self.ceph_user = self.dconf.get('user', 'admin')
         self.keyring = self.dconf.get('keyring', '')
         self.mon_host = self.dconf.get('mon_host', '')
+        self.prefix = self.dconf.get('prefix', '')
         
         # Validate Ceph configuration file exists
         if not os.path.exists(self.ceph_conf):
-            raise xs_errors.XenError('ConfigParameterInvalid',
-                                   opterr='Ceph config file not found: %s' % self.ceph_conf)
+            raise xs_errors.XenError('ConfigParameterInvalid', opterr='Ceph config file not found: %s' % self.ceph_conf)
         
         # Set up paths and properties
         self.path = "/dev/rbd/%s" % self.pool  # Kernel RBD device path
@@ -118,15 +120,11 @@ class CephRBDSR(SR.SR):
         # Initialize locking
         self.lock = Lock("CephRBDSR", sr_uuid)
         
-        # Test Ceph connectivity
-        self._test_ceph_connectivity()
-        
         util.SMlog("CephRBDSR loaded successfully: pool=%s" % self.pool)
     
     def create(self, sr_uuid, size):
         """Create new Ceph RBD storage repository"""
-        util.SMlog("Creating CephRBDSR %s with size %d in pool %s" % 
-                   (sr_uuid, size, self.pool))
+        util.SMlog("Creating CephRBDSR %s with size %d in pool %s" % (sr_uuid, size, self.pool))
         
         # Verify pool exists and is accessible
         try:
@@ -134,8 +132,7 @@ class CephRBDSR(SR.SR):
             util.pread2(cmd)
             util.SMlog("Verified pool %s exists" % self.pool)
         except Exception as e:
-            raise xs_errors.XenError('SRUnavailable',
-                                   opterr='Cannot access Ceph pool %s: %s' % (self.pool, str(e)))
+            raise xs_errors.XenError('SRUnavailable', opterr='Cannot access Ceph pool %s: %s' % (self.pool, str(e)))
         
         # Initialize statistics - virtual allocation starts at 0
         self.virtual_allocation = 0
@@ -216,26 +213,41 @@ class CephRBDSR(SR.SR):
                     image_name = image_info['image']
                     
                     # Check if this RBD image belongs to our SR (has VDI prefix and proper UUID)
-                    if image_name.startswith(self.RBD_PREFIX):
-                        vdi_uuid = image_name[len(self.RBD_PREFIX):]
-                        
-                        # Validate UUID format
-                        if self._is_valid_uuid(vdi_uuid):
-                            try:
-                                vdi = self.vdi(vdi_uuid)
-                                vdi._load_from_rbd_info(image_info)
-                                self.vdis[vdi_uuid] = vdi
-                                self.virtual_allocation += vdi.size
-                                util.SMlog("Found VDI: %s (size: %d)" % (vdi_uuid, vdi.size))
-                            except Exception as e:
-                                util.SMlog("Error loading VDI %s: %s" % (vdi_uuid, str(e)))
+                    if image_name.startswith(self.prefix + self.RBD_PREFIX):
+                        try:
+                            if ('snapshot' in image_info):
+                                snapshot_id = image_info['snapshot']
+                                vdi_uuid = snapshot_id[len(self.prefix + self.SNAP_PREFIX):]
+                                if (self._is_valid_uuid(vdi_uuid)):
+                                    parent_id = image_info['image']
+                                    vdi = self.vdi(vdi_uuid)
+                                    vdi._load_from_rbd_info(image_info)
+                                    # If the snapshot_of is missing, fix it
+                                    if (vdi.snapshot_of is None):
+                                        vdi.snapshot_of = parent_id[len(self.prefix + self.RBD_PREFIX):]
+                                        util.SMlog("Fixed missing snapshot_of for VDI %s: set to %s" % (vdi_uuid, vdi.snapshot_of))
+                                    self.vdis[snapshot_id] = vdi
+                                    self.virtual_allocation += vdi.size
+                                    util.SMlog("Found VDI snapshot of %s: %s (size: %d)" % (parent_id, snapshot_id, vdi.size))
+                            else:
+                                vdi_uuid = image_name[len(self.prefix + self.RBD_PREFIX):]
+                                if (self._is_valid_uuid(vdi_uuid)):
+                                    vdi = self.vdi(vdi_uuid)
+                                    vdi._load_from_rbd_info(image_info)
+                                    self.vdis[vdi_uuid] = vdi
+                                    self.virtual_allocation += vdi.size
+                                    util.SMlog("Found VDI: %s (size: %d)" % (vdi_uuid, vdi.size))
+
+                        except Exception as e:
+                            util.SMlog("Error loading VDI %s: %s" % (vdi_uuid, str(e)))
                 
-                util.SMlog("Scan complete: found %d VDIs, total allocation: %d" % 
-                          (len(self.vdis), self.virtual_allocation))
+                util.SMlog("Scan complete: found %d VDIs, total allocation: %d" % (len(self.vdis), self.virtual_allocation))
             
         except Exception as e:
             util.SMlog("Error during scan: %s" % str(e))
             raise xs_errors.XenError('SRScanError', opterr=str(e))
+        
+        return super(CephRBDSR, self).scan(sr_uuid)
     
     def vdi(self, uuid):
         """Create VDI object for given UUID"""
@@ -249,15 +261,9 @@ class CephRBDSR(SR.SR):
         total = s.get('total', 0)
         used = s.get('used', 0)
 
-        # Guard: avoid total==0 (XAPI will display 1 byte)
-        if total <= 0:
-            util.SMlog("CephRBDSR.stat: total==0; using clamp value")
-            total = 1
-            used = 0
-
         # Always update physical statistics from Ceph
-        self.physical_size = long(total)
-        self.physical_utilisation = long(used)
+        self.physical_size = total
+        self.physical_utilisation = used
 
         # Preserve existing virtual allocation if it's valid, otherwise get from XAPI
         if not hasattr(self, 'virtual_allocation') or self.virtual_allocation is None:
@@ -313,8 +319,8 @@ class CephRBDSR(SR.SR):
             total = 1
             used = 0
             
-        self.physical_size = long(total)
-        self.physical_utilisation = long(used)
+        self.physical_size = int(total)
+        self.physical_utilisation = int(used)
         
         # Ensure we have virtual allocation set
         if not hasattr(self, 'virtual_allocation'):
@@ -381,8 +387,7 @@ class CephRBDSR(SR.SR):
             # First check if the pool has a quota set
             quota_stats = self._get_pool_quota()
             if quota_stats:
-                util.SMlog("CephRBDSR: using pool quota: total=%d used=%d" % 
-                          (quota_stats['total'], quota_stats['used']))
+                util.SMlog("CephRBDSR: using pool quota: total=%d used=%d" %  (quota_stats['total'], quota_stats['used']))
                 return quota_stats
             
             # Fall back to cluster capacity if no quota is set
@@ -399,11 +404,9 @@ class CephRBDSR(SR.SR):
                     #  - stored       : logical bytes stored (user-visible)
                     #  - bytes_used   : raw bytes (includes replication) - optional per pool
                     free  = int(stats.get('max_avail', 0) or 0)
-                    used  = int((stats.get('stored')
-                                if 'stored' in stats else stats.get('bytes_used', 0)) or 0)
+                    used  = int((stats.get('stored') if 'stored' in stats else stats.get('bytes_used', 0)) or 0)
                     total = free + used
                     return {'free': free, 'used': used, 'total': total}
-
             raise Exception("Pool %s not found in ceph df" % self.pool)
         except Exception as e:
             util.SMlog("CephRBDSR: df parse failed: %s" % str(e))
@@ -472,15 +475,67 @@ class CephRBDVDI(VDI.VDI):
     """Ceph RBD VDI implementation"""
     
     def __init__(self, sr, uuid):
-        VDI.VDI.__init__(self, sr, uuid)
-        
-        # RBD-specific properties
-        self.rbd_name = "%s%s" % (sr.RBD_PREFIX, uuid)
-        self.device_path = "/dev/rbd/%s/%s" % (sr.pool, self.rbd_name)
+        # Default RBD-specific properties (for regular images)
         self.mapped = False
-        
+        self.snapshot_of = None
+        self.is_protected = False
+        self.is_a_snapshot = False
+        VDI.VDI.__init__(self, sr, uuid)
         # Set VDI type - RBD provides raw block devices
         self.vdi_type = vhdutil.VDI_TYPE_RAW  # 'aio'
+        if (self.is_a_snapshot):
+            self.rbd_name = "%s%s%s" % (sr.prefix, sr.SNAP_PREFIX, uuid)
+            self.device_path = None
+        else:
+            self.rbd_name = "%s%s%s" % (sr.prefix, sr.RBD_PREFIX, uuid)
+            self.device_path = "/dev/rbd/%s/%s" % (sr.pool, self.rbd_name)
+    
+    def _load_if_exists(self, vdi_uuid):
+        """Load VDI properties from XAPI database only if VDI exists in XAPI"""
+        try:
+            # Check if VDI exists in XAPI database
+            vdi_ref = self.sr.session.xenapi.VDI.get_by_uuid(vdi_uuid)
+            
+            # VDI exists, load its properties
+            util.SMlog("Loading existing VDI properties from XAPI database for %s" % vdi_uuid)
+            
+            # Call parent load method first  
+            VDI.VDI.load(self, vdi_uuid)
+            
+            # Load key properties from XAPI database
+            self.is_a_snapshot = self.sr.session.xenapi.VDI.get_is_a_snapshot(vdi_ref)
+            self.read_only = self.sr.session.xenapi.VDI.get_read_only(vdi_ref)
+            self.size = int(self.sr.session.xenapi.VDI.get_virtual_size(vdi_ref))
+            self.utilisation = int(self.sr.session.xenapi.VDI.get_physical_utilisation(vdi_ref))
+            
+            # Load sm_config to get RBD-specific information
+            sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
+            
+            # Extract snapshot name and RBD name from sm_config if it's a snapshot
+            if self.is_a_snapshot:
+                snapshot_of_uuid = sm_config.get('snapshot_of', '')
+                snapshot_name = self.sr.SNAP_PREFIX + vdi_uuid
+                
+                if snapshot_of_uuid:
+                    # For snapshots, rbd_name is parent_image@snapshot_name
+                    parent_rbd_name = "%s%s%s" % (self.sr.prefix, self.sr.RBD_PREFIX, snapshot_of_uuid)
+                    self.rbd_name = "%s@%s" % (parent_rbd_name, snapshot_name)
+                    self.snapshot_of = snapshot_of_uuid
+                    util.SMlog("Loaded snapshot VDI: %s -> RBD name: %s" % (vdi_uuid, self.rbd_name))
+                else:
+                    util.SMlog("Warning: Snapshot VDI %s missing snapshot_of in sm_config" % vdi_uuid)
+            
+            util.SMlog("Loaded existing VDI %s: is_snapshot=%s, read_only=%s, size=%d" % (vdi_uuid, self.is_a_snapshot, self.read_only, self.size))
+            return True
+            
+        except Exception as e:
+            # VDI doesn't exist in XAPI database - this is normal for newly discovered RBD images
+            util.SMlog("VDI %s not found in XAPI database (new discovery): %s" % (vdi_uuid, str(e)))
+            # Keep the default values set in __init__
+            return False
+
+    def load(self, vdi_uuid):
+        return self._load_if_exists(vdi_uuid)
     
     def create(self, sr_uuid, vdi_uuid, size):
         """Create new RBD image"""
@@ -489,24 +544,9 @@ class CephRBDVDI(VDI.VDI):
         # Set VDI properties
         self.uuid = vdi_uuid
         self.location = vdi_uuid  # For RBD, location is the VDI UUID
-        self.size = long(size)
+        self.size = size
         self.utilisation = 0  # Ceph uses thin provisioning
         self.vdi_type = vhdutil.VDI_TYPE_RAW  # RBD provides raw block devices
-        
-        # Check available space in pool
-        pool_stats = self.sr._get_pool_stats()
-        available = pool_stats.get('total', 0) - pool_stats.get('used', 0)
-        
-        if available > 0 and size > available:
-            quota_stats = self.sr._get_pool_quota()
-            if quota_stats:
-                raise xs_errors.XenError('SRNoSpace',
-                                       opterr='VDI size %d bytes exceeds pool quota free space %d bytes' % 
-                                              (size, available))
-            else:
-                raise xs_errors.XenError('SRNoSpace',
-                                       opterr='VDI size %d bytes exceeds pool free space %d bytes' % 
-                                              (size, available))
         
         try:
             # Create RBD image with specified size and XCP-ng compatible features
@@ -539,65 +579,119 @@ class CephRBDVDI(VDI.VDI):
                 util.pread2(cmd)
             except:
                 pass
-            raise xs_errors.XenError('VDICreate',
-                                   opterr='Failed to create RBD image: %s' % str(e))
+            raise xs_errors.XenError('VDICreate', opterr='Failed to create RBD image: %s' % str(e))
     
+    def _parent_name(self):
+        """Get parent image name if this VDI is a snapshot"""
+        if self.is_a_snapshot and self.snapshot_of:
+            return "%s%s%s" % (self.sr.prefix, self.sr.RBD_PREFIX, self.snapshot_of)
+        return None
+
+    def _try_find_parent(self):
+        try:
+            # Check if parent image exists in the pool
+            cmd = self.sr._build_rbd_cmd(['ls', '-l', '--format', 'json'])
+            output = util.pread2(cmd)
+            if (output.strip()):
+                data = json.loads(output)
+                for image_info in data:
+                    if image_info['snapshot'] == self.rbd_name:
+                        return image_info['image']
+            
+        except Exception as e:
+            util.SMlog("Parent image for snapshot %s not found: %s" % (self.rbd_name, str(e)))
+            return None
+
     def delete(self, sr_uuid, vdi_uuid, data_only=False):
         """Delete RBD image"""
         util.SMlog("Deleting CephRBD VDI %s (data_only=%s)" % (vdi_uuid, data_only))
+        util.SMlog("Is a snapshot: %s" % self.is_a_snapshot)
         
         # Check if VDI is in use - follow SM framework convention
         if hasattr(self, 'attached') and self.attached:
-            raise xs_errors.XenError('VDIInUse',
-                                   opterr='VDI is currently attached')
+            raise xs_errors.XenError('VDIInUse', opterr='VDI is currently attached')
         
         # Check if RBD image is mapped anywhere and try to unmap it
         # This handles cases where the VDI was not properly detached (crashes, etc.)
         try:
-            cmd = ['rbd', 'showmapped', '--format', 'json']
-            output = util.pread2(cmd)
-            
-            if output.strip():
-                mapped_devices = json.loads(output)
-                
-                # rbd showmapped returns a list of mapped devices
-                for device_info in mapped_devices:
-                    if (device_info.get('name') == self.rbd_name and 
-                        device_info.get('pool') == self.sr.pool):
-                        mapped_device = device_info.get('device')
-                        util.SMlog("Found VDI %s mapped to device %s, attempting to unmap" % 
-                                  (vdi_uuid, mapped_device))
-                        try:
-                            cmd = self.sr._build_rbd_cmd(['unmap', mapped_device])
-                            util.pread2(cmd)
-                            util.SMlog("Successfully unmapped device %s" % mapped_device)
-                        except Exception as e:
-                            util.SMlog("Warning: Failed to unmap device %s: %s" % (mapped_device, str(e)))
-                        break
+            self._verify_mapping()
+
+            if (self.mapped):
+                try:
+                    cmd = self.sr._build_rbd_cmd(['unmap', self.device_path])
+                    util.pread2(cmd)
+                    util.SMlog("Successfully unmapped device %s" % self.device_path)
+                except Exception as e:
+                    util.SMlog("Warning: Failed to unmap device %s: %s" % (self.device_path, str(e)))
         except Exception as e:
             util.SMlog("Warning: Failed to check mapped devices: %s" % str(e))
         
-        # Check for snapshots (RBD doesn't allow deletion of images with snapshots)
-        try:
-            cmd = self.sr._build_rbd_cmd(['snap', 'ls', self.rbd_name])
-            output = util.pread2(cmd)
-            
-            # If output contains snapshot entries, we can't delete
-            if output.strip() and 'SNAPID' in output:
-                snapshots = [line for line in output.split('\n') if line.strip() and 'SNAPID' not in line]
-                if snapshots:
-                    raise xs_errors.XenError('VDIInUse',
-                                           opterr='VDI has %d snapshots, cannot delete' % len(snapshots))
-        except:
-            # If snap ls fails, proceed with deletion attempt
-            pass
+        # If this is a snapshot, check if it's protected
+        if (self.is_a_snapshot):
+            if (self.is_protected):
+                raise xs_errors.XenError('VDIInUse', opterr='VDI is a protected snapshot, cannot delete')
+        else:
+            # Check for snapshots (RBD doesn't allow deletion of images with snapshots)
+            try:
+                # Get a JSON list of snapshots for this image
+                cmd = self.sr._build_rbd_cmd(['snap', 'ls', self.rbd_name, '--format', 'json'])
+                output = util.pread2(cmd)
+
+                if output.strip():
+                    snapshot_data = json.loads(output)
+                    snapshot_count = len(snapshot_data)
+                
+                    if snapshot_count > 0:
+                        raise xs_errors.XenError('VDIInUse', opterr='VDI has %d snapshots, cannot delete' % snapshot_count)
+            except Exception as e:
+                util.SMlog("Warning: Failed to check for snapshots: %s" % str(e))
         
         try:
-            # Delete the RBD image
-            cmd = self.sr._build_rbd_cmd(['rm', self.rbd_name])
-            util.pread2(cmd)
-            
-            util.SMlog("Deleted RBD image: %s" % self.rbd_name)
+            # Check if this VDI represents a snapshot (rbd_name contains @)
+            if self.is_a_snapshot:
+                # This is a snapshot, unprotect and delete it
+                util.SMlog("Deleting RBD snapshot: %s" % self.rbd_name)
+
+                # In very rare cases, such as when snapshot is discovered during scan, the snapshot_of may be missing, if that's the case we fix it
+                if (self.snapshot_of is None):
+                    self.snapshot_of = self._try_find_parent()
+                    if (self.snapshot_of is None):
+                        raise xs_errors.XenError('VDIDelete', opterr='Snapshot missing snapshot_of and parent image not found')
+                    else:
+                        util.SMlog("Fixed missing snapshot_of for snapshot %s: set to %s" % (self.rbd_name, self.snapshot_of))
+
+                try:
+                    # First try to unprotect the snapshot
+                    cmd = self.sr._build_rbd_cmd(['snap', 'unprotect', '--image', self._parent_name(), '--snap', self.rbd_name])
+                    util.pread2(cmd)
+                    util.SMlog("Unprotected snapshot: %s" % self.rbd_name)
+                except Exception as e:
+                    # If unprotect fails, the snapshot might not be protected or might have children
+                    util.SMlog("Warning: Failed to unprotect snapshot %s: %s" % (self.rbd_name, str(e)))
+                    # Check if snapshot has children (clones)
+                    image_name, snap_name = self.rbd_name.split('@', 1)
+                    try:
+                        cmd = self.sr._build_rbd_cmd(['children', self.rbd_name])
+                        children = util.pread2(cmd)
+                        if children.strip():
+                            raise xs_errors.XenError('VDIInUse',
+                                                   opterr='Snapshot has children (clones), cannot delete: %s' % children.strip())
+                    except Exception:
+                        pass  # children command might fail if no children
+                
+                # Delete the snapshot
+                cmd = self.sr._build_rbd_cmd(['snap', 'rm', '--image', self._parent_name(), '--snap', self.rbd_name])
+                util.pread2(cmd)
+                util.SMlog("Deleted RBD snapshot: %s" % self.rbd_name)
+                
+            else:
+                # This is a regular RBD image
+                util.SMlog("Deleting RBD image: %s" % self.rbd_name)
+                
+                # Delete the RBD image
+                cmd = self.sr._build_rbd_cmd(['rm', self.rbd_name])
+                util.pread2(cmd)
+                util.SMlog("Deleted RBD image: %s" % self.rbd_name)
             
             # Update SR allocation and statistics
             if self.uuid in self.sr.vdis:
@@ -609,14 +703,21 @@ class CephRBDVDI(VDI.VDI):
                 self.sr._updateStats(sr_uuid, -size_to_subtract)
                 
         except Exception as e:
-            # If deletion still fails due to watchers, provide a more helpful error
+            # Handle different types of deletion errors
             error_str = str(e)
+            
             if 'watchers' in error_str or 'still has watchers' in error_str:
-                raise xs_errors.XenError('VDIInUse',
-                                       opterr='VDI is still mapped on one or more hosts. Please ensure all VMs using this VDI are shut down and try again.')
+                raise xs_errors.XenError('VDIInUse', opterr='VDI is still mapped on one or more hosts. Please ensure all VMs using this VDI are shut down and try again.')
+            elif 'No such file or directory' in error_str:
+                # RBD image/snapshot doesn't exist - this might be an orphaned XAPI VDI entry
+                util.SMlog("RBD image/snapshot %s does not exist - might be orphaned XAPI entry, cleaning up VDI record" % self.rbd_name)
+                # Still remove from SR vdis list to clean up
+                if self.uuid in self.sr.vdis:
+                    del self.sr.vdis[self.uuid]
+                # This is not really an error - the VDI is effectively deleted
+                util.SMlog("Successfully cleaned up orphaned VDI entry: %s" % self.uuid)
             else:
-                raise xs_errors.XenError('VDIDelete',
-                                       opterr='Failed to delete RBD image: %s' % str(e))
+                raise xs_errors.XenError('VDIDelete', opterr='Failed to delete RBD image/snapshot: %s' % str(e))
     
     def _resolve_device_path(self, path):
         """Resolve device path, following symlinks to get the actual device"""
@@ -636,7 +737,7 @@ class CephRBDVDI(VDI.VDI):
             return path
     
     def _check_rbd_mapping(self):
-        """Check if this RBD image is currently mapped and return device path"""
+        """Check if this RBD image/snapshot is currently mapped and return device path"""
         try:
             cmd = ['rbd', 'showmapped', '--format', 'json']
             output = util.pread2(cmd)
@@ -644,15 +745,27 @@ class CephRBDVDI(VDI.VDI):
             if output.strip():
                 mapped_devices = json.loads(output)
                 
-                # Find our RBD image in the mapped devices list
-                for device_info in mapped_devices:
-                    if (device_info.get('name') == self.rbd_name and 
-                        device_info.get('pool') == self.sr.pool):
-                        device_path = device_info.get('device')
-                        util.SMlog("RBD image %s is mapped to device %s" % (self.rbd_name, device_path))
-                        return device_path
+                # For snapshots, we need to match both image name and snapshot name
+                if '@' in self.rbd_name:
+                    image_name, snap_name = self.rbd_name.split('@', 1)
+                    for device_info in mapped_devices:
+                        if (device_info.get('name') == image_name and 
+                            device_info.get('snap') == snap_name and
+                            device_info.get('pool') == self.sr.pool):
+                            device_path = device_info.get('device')
+                            util.SMlog("RBD snapshot %s is mapped to device %s" % (self.rbd_name, device_path))
+                            return device_path
+                else:
+                    # Regular image - match by name and ensure no snapshot
+                    for device_info in mapped_devices:
+                        if (device_info.get('name') == self.rbd_name and 
+                            device_info.get('snap') == '-' and  # No snapshot
+                            device_info.get('pool') == self.sr.pool):
+                            device_path = device_info.get('device')
+                            util.SMlog("RBD image %s is mapped to device %s" % (self.rbd_name, device_path))
+                            return device_path
                         
-            util.SMlog("RBD image %s is not currently mapped" % self.rbd_name)
+            util.SMlog("RBD image/snapshot %s is not currently mapped" % self.rbd_name)
             return None
             
         except Exception as e:
@@ -660,7 +773,7 @@ class CephRBDVDI(VDI.VDI):
             return None
     
     def attach(self, sr_uuid, vdi_uuid):
-        """Attach RBD image - map to kernel device"""
+        """Attach RBD image or snapshot - map to kernel device"""
         util.SMlog("Attaching CephRBD VDI %s" % self.uuid)
         
         # If we already have a device path tracked, verify it's still valid
@@ -675,7 +788,7 @@ class CephRBDVDI(VDI.VDI):
                     
                     for device_info in mapped_devices:
                         if (device_info.get('device') == self.device_path and
-                            device_info.get('name') == self.rbd_name and
+                            device_info.get('name') == self.rbd_name.split('@')[0] and  # Handle snapshots
                             device_info.get('pool') == self.sr.pool):
                             util.SMlog("VDI %s already mapped to tracked device %s" % (self.uuid, self.device_path))
                             self.mapped = True
@@ -691,7 +804,7 @@ class CephRBDVDI(VDI.VDI):
             except Exception as e:
                 util.SMlog("Warning: Failed to verify existing device mapping: %s" % str(e))
         
-        # Check if our RBD image is mapped to any device (but don't reuse if we have a specific path tracked)
+        # Check if our RBD image/snapshot is mapped to any device
         existing_device = self._check_rbd_mapping()
         if existing_device and (not hasattr(self, 'device_path') or not self.device_path):
             util.SMlog("VDI %s found mapped to %s (no specific device tracked)" % (self.uuid, existing_device))
@@ -699,7 +812,9 @@ class CephRBDVDI(VDI.VDI):
             self.mapped = True
         else:
             try:
-                # Map RBD image to kernel device
+                # Map RBD image or snapshot to kernel device
+                # For snapshots, rbd_name will be in format "image@snap-name"
+                # For regular images, rbd_name will be just "image-name"
                 cmd = self.sr._build_rbd_cmd(['map', self.rbd_name])
                 
                 device = util.pread2(cmd).strip()
@@ -753,14 +868,27 @@ class CephRBDVDI(VDI.VDI):
                         
                         for device_info in mapped_devices:
                             mapped_device = device_info.get('device')
-                            if (mapped_device == resolved_device_path and
-                                device_info.get('name') == self.rbd_name and
-                                device_info.get('pool') == self.sr.pool):
-                                # Use the original device path (could be symlink) for unmapping
-                                device_to_unmap = self.device_path
-                                util.SMlog("Using tracked device path for detach: %s (resolved: %s)" % 
-                                          (device_to_unmap, resolved_device_path))
-                                break
+                            # Check if this device matches our image/snapshot
+                            if mapped_device == resolved_device_path:
+                                if '@' in self.rbd_name:
+                                    # For snapshots, match image name and snapshot name
+                                    image_name, snap_name = self.rbd_name.split('@', 1)
+                                    if (device_info.get('name') == image_name and
+                                        device_info.get('snap') == snap_name and
+                                        device_info.get('pool') == self.sr.pool):
+                                        device_to_unmap = self.device_path
+                                        util.SMlog("Using tracked device path for snapshot detach: %s (resolved: %s)" % 
+                                                  (device_to_unmap, resolved_device_path))
+                                        break
+                                else:
+                                    # For regular images, match image name and ensure no snapshot
+                                    if (device_info.get('name') == self.rbd_name and
+                                        device_info.get('snap') == '-' and
+                                        device_info.get('pool') == self.sr.pool):
+                                        device_to_unmap = self.device_path
+                                        util.SMlog("Using tracked device path for detach: %s (resolved: %s)" % 
+                                                  (device_to_unmap, resolved_device_path))
+                                        break
                                 
                 except Exception as e:
                     util.SMlog("Warning: Failed to verify tracked device mapping: %s" % str(e))
@@ -795,68 +923,64 @@ class CephRBDVDI(VDI.VDI):
             util.SMlog("Warning: Failed to unmap RBD device %s: %s" % (device_to_unmap, str(e)))
     
     def snapshot(self, sr_uuid, vdi_uuid):
-        """Create RBD snapshot and clone"""
+        """Create RBD snapshot (read-only)"""
         util.SMlog("Creating CephRBD snapshot from VDI %s" % self.uuid)
         
-        # Generate new UUID for the snapshot/clone
-        clone_uuid = util.gen_uuid()
-        util.SMlog("Generated new UUID for snapshot: %s" % clone_uuid)
+        # Generate new UUID for the snapshot
+        snapshot_uuid = util.gen_uuid()
+        util.SMlog("Generated new UUID for snapshot: %s" % snapshot_uuid)
 
-        clone_name = "%s%s" % (self.sr.RBD_PREFIX, clone_uuid)
-        snapshot_name = "snap-%s" % clone_uuid
+        snapshot_name = "snap-%s" % snapshot_uuid
         
         try:
             # Create snapshot of current RBD image
             cmd = self.sr._build_rbd_cmd(['snap', 'create', '%s@%s' % (self.rbd_name, snapshot_name)])
             util.pread2(cmd)
             
-            # Protect snapshot (required for cloning)
+            # Protect snapshot (makes it read-only and prevents deletion)
             cmd = self.sr._build_rbd_cmd(['snap', 'protect', '%s@%s' % (self.rbd_name, snapshot_name)])
             util.pread2(cmd)
             
-            # Create clone from snapshot
-            cmd = self.sr._build_rbd_cmd([
-                'clone', 
-                '%s@%s' % (self.rbd_name, snapshot_name),
-                clone_name
-            ])
-            util.pread2(cmd)
-            
-            # Create snapshot VDI object with the new UUID
-            snapshot_vdi = self.sr.vdi(clone_uuid)
+            # Create snapshot VDI object with the new UUID - this represents the read-only snapshot
+            snapshot_vdi = self.sr.vdi(snapshot_uuid)
             snapshot_vdi.size = self.size
             snapshot_vdi.vdi_type = self.vdi_type
-            snapshot_vdi.utilisation = 0  # Clone is thin-provisioned
+            snapshot_vdi.utilisation = 0  # Snapshot is thin-provisioned
             snapshot_vdi.parent = self
-            snapshot_vdi.rbd_name = clone_name
+            # Store the snapshot reference instead of RBD image name
+            snapshot_vdi.rbd_name = "%s@%s" % (self.rbd_name, snapshot_name)
             
             # Set additional VDI properties for proper database introduction
-            snapshot_vdi.location = clone_uuid
-            snapshot_vdi.read_only = False  # Clone is writable
+            snapshot_vdi.location = snapshot_uuid
+            snapshot_vdi.read_only = True  # Snapshots are read-only
             snapshot_vdi.label = self.label + " (snapshot)"
             snapshot_vdi.description = "Snapshot of " + self.description
             snapshot_vdi.ty = "user"  # VDI type for XAPI
             snapshot_vdi.shareable = False
             snapshot_vdi.managed = True
-            snapshot_vdi.is_a_snapshot = False  # Clone is not a snapshot, it's a new VDI
+            snapshot_vdi.is_a_snapshot = True  # This IS a snapshot
             snapshot_vdi.metadata_of_pool = ""
-            snapshot_vdi.snapshot_time = "19700101T00:00:00Z"
-            snapshot_vdi.snapshot_of = ""
+            snapshot_vdi.snapshot_time = datetime.datetime.utcnow().strftime("%Y%m%dT%H:%M:%SZ")  # Current timestamp in ISO format
+            snapshot_vdi.snapshot_of = self.uuid  # Reference to parent VDI
             snapshot_vdi.cbt_enabled = False
             
             # Initialize sm_config
             if not hasattr(snapshot_vdi, 'sm_config'):
                 snapshot_vdi.sm_config = {}
             snapshot_vdi.sm_config['vdi_type'] = self.vdi_type
+            # Mark this as a snapshot in sm_config
+            snapshot_vdi.sm_config['snapshot'] = 'true'
+            snapshot_vdi.sm_config['snapshot_of'] = self.uuid
+            snapshot_vdi.sm_config['snapshot_name'] = snapshot_name  # Store snapshot name for later retrieval
             
             # Introduce the new VDI to XAPI database
             vdi_ref = snapshot_vdi._db_introduce()
-            util.SMlog("vdi_snapshot: introduced VDI: %s (%s)" % (vdi_ref, clone_uuid))
+            util.SMlog("vdi_snapshot: introduced VDI: %s (%s)" % (vdi_ref, snapshot_uuid))
             
             # Add to SR with the new UUID
-            self.sr.vdis[clone_uuid] = snapshot_vdi
+            self.sr.vdis[snapshot_uuid] = snapshot_vdi
             
-            util.SMlog("Created RBD snapshot and clone: %s (UUID: %s)" % (clone_name, clone_uuid))
+            util.SMlog("Created RBD snapshot: %s (UUID: %s)" % (snapshot_vdi.rbd_name, snapshot_uuid))
             return snapshot_vdi.get_params()
             
         except Exception as e:
@@ -870,12 +994,97 @@ class CephRBDVDI(VDI.VDI):
             except:
                 pass
             
-            raise xs_errors.XenError('VDIClone',
+            raise xs_errors.XenError('VDISnapshot',
                                    opterr='Failed to create RBD snapshot: %s' % str(e))
     
     def clone(self, sr_uuid, vdi_uuid):
-        """Clone VDI (same as snapshot for RBD)"""
-        return self.snapshot(sr_uuid, vdi_uuid)
+        """Clone VDI (create writable copy from snapshot)"""
+        util.SMlog("Creating CephRBD clone from VDI %s" % self.uuid)
+        
+        # Generate new UUID for the clone
+        clone_uuid = util.gen_uuid()
+        util.SMlog("Generated new UUID for clone: %s" % clone_uuid)
+
+        clone_name = "%s%s%s" % (self.sr.prefix, self.sr.RBD_PREFIX, clone_uuid)
+        snapshot_name = "snap-clone-%s" % clone_uuid
+        
+        try:
+            # Create snapshot of current RBD image
+            cmd = self.sr._build_rbd_cmd(['snap', 'create', '%s@%s' % (self.rbd_name, snapshot_name)])
+            util.pread2(cmd)
+            
+            # Protect snapshot (required for cloning)
+            cmd = self.sr._build_rbd_cmd(['snap', 'protect', '%s@%s' % (self.rbd_name, snapshot_name)])
+            util.pread2(cmd)
+            
+            # Create clone from snapshot (this creates a new writable RBD image)
+            cmd = self.sr._build_rbd_cmd([
+                'clone', 
+                '%s@%s' % (self.rbd_name, snapshot_name),
+                clone_name
+            ])
+            util.pread2(cmd)
+            
+            # Create clone VDI object with the new UUID
+            clone_vdi = self.sr.vdi(clone_uuid)
+            clone_vdi.size = self.size
+            clone_vdi.vdi_type = self.vdi_type
+            clone_vdi.utilisation = 0  # Clone is thin-provisioned
+            clone_vdi.parent = self
+            clone_vdi.rbd_name = clone_name
+            
+            # Set additional VDI properties for proper database introduction
+            clone_vdi.location = clone_uuid
+            clone_vdi.read_only = False  # Clone is writable
+            clone_vdi.label = self.label + " (clone)"
+            clone_vdi.description = "Clone of " + self.description
+            clone_vdi.ty = "user"  # VDI type for XAPI
+            clone_vdi.shareable = False
+            clone_vdi.managed = True
+            clone_vdi.is_a_snapshot = False  # Clone is not a snapshot, it's a new VDI
+            clone_vdi.metadata_of_pool = ""
+            clone_vdi.snapshot_time = "19700101T00:00:00Z"
+            clone_vdi.snapshot_of = ""
+            clone_vdi.cbt_enabled = False
+            
+            # Initialize sm_config
+            if not hasattr(clone_vdi, 'sm_config'):
+                clone_vdi.sm_config = {}
+            clone_vdi.sm_config['vdi_type'] = self.vdi_type
+            # Mark the parent snapshot info in sm_config 
+            clone_vdi.sm_config['clone_of'] = self.uuid
+            clone_vdi.sm_config['parent_snapshot'] = "%s@%s" % (self.rbd_name, snapshot_name)
+            
+            # Introduce the new VDI to XAPI database
+            vdi_ref = clone_vdi._db_introduce()
+            util.SMlog("vdi_clone: introduced VDI: %s (%s)" % (vdi_ref, clone_uuid))
+            
+            # Add to SR with the new UUID
+            self.sr.vdis[clone_uuid] = clone_vdi
+            
+            util.SMlog("Created RBD clone: %s (UUID: %s)" % (clone_name, clone_uuid))
+            return clone_vdi.get_params()
+            
+        except Exception as e:
+            # Cleanup on failure
+            try:
+                # Remove clone if it was created
+                cmd = self.sr._build_rbd_cmd(['rm', clone_name])
+                util.pread2(cmd)
+            except:
+                pass
+                
+            try:
+                # Unprotect and remove snapshot if it was created
+                cmd = self.sr._build_rbd_cmd(['snap', 'unprotect', '%s@%s' % (self.rbd_name, snapshot_name)])
+                util.pread2(cmd)
+                cmd = self.sr._build_rbd_cmd(['snap', 'rm', '%s@%s' % (self.rbd_name, snapshot_name)])
+                util.pread2(cmd)
+            except:
+                pass
+            
+            raise xs_errors.XenError('VDIClone',
+                                   opterr='Failed to create RBD clone: %s' % str(e))
     
     def resize(self, sr_uuid, vdi_uuid, size, online=False):
         """Resize RBD image"""
@@ -922,6 +1131,44 @@ class CephRBDVDI(VDI.VDI):
         if not self.attached and self.mapped:
             self.detach(sr_uuid, vdi_uuid)
     
+    def _verify_mapping(self):
+        # Check if RBD is mapped to block device, and if our internal mapping info is up-to-date
+        cmd = ['rbd', 'showmapped', '--format', 'json']
+        output = util.pread2(cmd)
+        
+        if output.strip():
+            mapped_devices = json.loads(output)
+            
+            # If we already have a specific device_path tracked, verify it's still valid
+            if hasattr(self, 'device_path') and self.device_path:
+                for device_info in mapped_devices:
+                    if (device_info.get('name') == self.rbd_name and device_info.get('pool') == self.sr.pool):
+                        if device_info.get('device') == self.device_path:
+                            self.mapped = True
+                            util.SMlog("Verified tracked device %s is still mapped for %s" % (self.device_path, self.rbd_name))
+                        else:
+                            util.SMlog("VDI %s expected at %s found at %s - updating mapping" % (self.rbd_name, self.device_path, device_info.get('device')))
+                            self.device_path = device_info.get('device')
+                            self.mapped = True
+                        return
+                        
+                # Our tracked device is no longer valid, clear it
+                util.SMlog("RBD for %s is not currently mapped (expected at %s)" % (self.rbd_name, self.device_path))
+                self.mapped = False
+            else:
+                # No specific device tracked, find any mapping (for initial discovery)
+                for device_info in mapped_devices:
+                    if (device_info.get('name') == self.rbd_name and 
+                        device_info.get('pool') == self.sr.pool):
+                        self.device_path = device_info.get('device', self.device_path)
+                        self.mapped = True
+                        util.SMlog("Discovered %s mapped to %s during scan" % (self.rbd_name, self.device_path))
+                        return
+                self.mapped = False
+        else:
+            # No mapped devices found
+            self.mapped = False
+
     def _load_from_rbd_info(self, rbd_info):
         """Load VDI properties from RBD ls output"""
         self.size = rbd_info.get('size', 0)
@@ -929,45 +1176,15 @@ class CephRBDVDI(VDI.VDI):
         # RBD images are thin-provisioned, so utilisation is initially 0
         # We could query 'rbd disk-usage' for actual usage but it's expensive
         self.utilisation = 0
+
+        if ('snapshot' in rbd_info):
+            self.is_a_snapshot = True
+            # Snapshots in CEPH are always read-only
+            self.read_only = True
+            self.parent_uuid = rbd_info['image']
         
-        # Check if image is currently mapped, but preserve any existing device_path tracking
-        # This prevents overwriting a specifically tracked device with a different mapping
         try:
-            cmd = ['rbd', 'showmapped', '--format', 'json']
-            output = util.pread2(cmd)
-            
-            if output.strip():
-                mapped_devices = json.loads(output)
-                
-                # If we already have a specific device_path tracked, verify it's still valid
-                if hasattr(self, 'device_path') and self.device_path:
-                    for device_info in mapped_devices:
-                        if (device_info.get('device') == self.device_path and
-                            device_info.get('name') == self.rbd_name and 
-                            device_info.get('pool') == self.sr.pool):
-                            self.mapped = True
-                            util.SMlog("Verified tracked device %s is still mapped for %s" % 
-                                      (self.device_path, self.rbd_name))
-                            return
-                            
-                    # Our tracked device is no longer valid, clear it
-                    util.SMlog("Tracked device %s no longer valid for %s" % 
-                              (self.device_path, self.rbd_name))
-                    self.mapped = False
-                    
-                else:
-                    # No specific device tracked, find any mapping (for initial discovery)
-                    for device_info in mapped_devices:
-                        if (device_info.get('name') == self.rbd_name and 
-                            device_info.get('pool') == self.sr.pool):
-                            self.device_path = device_info.get('device', self.device_path)
-                            self.mapped = True
-                            util.SMlog("Discovered %s mapped to %s during scan" % 
-                                      (self.rbd_name, self.device_path))
-                            break
-            else:
-                # No mapped devices found
-                self.mapped = False
+            self._verify_mapping()
                 
         except Exception as e:
             # If we can't determine mapping status, assume not mapped
