@@ -787,8 +787,10 @@ class CephRBDVDI(VDI.VDI):
         util.SMlog("Detaching CephRBD VDI %s" % self.uuid)
         
         if not self.mapped_path_known:
-            # Show error here - we can't continue
-            raise xs_errors.XenError('VDINotAttached', opterr='VDI was not properly attached, cannot detach safely')
+            # This should never happen, but if it does, instead of crashing, we log it and continue, in worst
+            # case the device remains mapped and can be cleaned up manually
+            util.SMlog("WARNING: Mapped path not known, this is a bug!")
+            return
 
         self.device_path = self.mapped_path
 
