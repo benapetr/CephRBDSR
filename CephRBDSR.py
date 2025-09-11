@@ -494,6 +494,9 @@ class CephRBDVDI(VDI.VDI):
         else:
             self.rbd_name = "%s%s%s" % (sr.prefix, sr.RBD_PREFIX, uuid)
             self.device_path = "/dev/rbd/%s/%s" % (sr.pool, self.rbd_name)
+
+        if not hasattr(self, 'sm_config'):
+            self.sm_config = {}
     
     def _load_if_exists(self, vdi_uuid):
         """Load VDI properties from XAPI database only if VDI exists in XAPI"""
@@ -516,13 +519,17 @@ class CephRBDVDI(VDI.VDI):
             # Load sm_config to get RBD-specific information
             self.sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
             
-            # Restore the device path if it was stored during attach
-            if 'attached_device_path' in self.sm_config:
+            # Restore the device path if it was stored during attach (using host-specific key)
+            host_ref = self.sr.session.xenapi.host.get_by_uuid(util.get_this_host())
+            host_key = "host_%s_device_path" % host_ref
+            if host_key in self.sm_config:
                 self.attached = True
                 self.mapped = True
                 self.mapped_path_known = True
-                self.mapped_path = self.sm_config['attached_device_path']
-                util.SMlog("Restored mapped path from sm_config: %s" % self.mapped_path)
+                self.mapped_path = self.sm_config[host_key]
+                util.SMlog("Restored mapped path from sm_config for host %s: %s" % (host_ref, self.mapped_path))
+            else:
+                util.SMlog("Key not found: %s" % host_key)
             
             # Extract snapshot name and RBD name from sm_config if it's a snapshot
             if self.is_a_snapshot:
@@ -761,9 +768,16 @@ class CephRBDVDI(VDI.VDI):
         self.path = self.device_path
         self.attached = True
 
-        # Store the device path in VDI sm_config for retrieval during detach
-        self.sm_config['attached_device_path'] = self.device_path
-        self._db_update()
+        # Store the device path in VDI sm_config with host-specific key for migration resilience
+        # Use host-specific key to support multiple simultaneous attachments during migration
+        host_ref = self.sr.session.xenapi.host.get_by_uuid(util.get_this_host())
+        host_key = "host_%s_device_path" % host_ref
+        
+        # Use direct XAPI call to add host-specific key (bypasses _db_update filtering)
+        vdi_ref = self.sr.session.xenapi.VDI.get_by_uuid(self.uuid)
+        self.sr.session.xenapi.VDI.add_to_sm_config(vdi_ref, host_key, self.device_path)
+        
+        util.SMlog("Stored device path %s for host %s in sm_config key %s" % (self.device_path, host_ref, host_key))
         
         # Call base class attach which returns the proper XMLRPC struct
         return VDI.VDI.attach(self, sr_uuid, vdi_uuid)
@@ -785,16 +799,18 @@ class CephRBDVDI(VDI.VDI):
             self.mapped = False
             self.attached = False
             
-            # Clean up the stored device path from sm_config
-            try:
-                vdi_ref = self.sr.session.xenapi.VDI.get_by_uuid(self.uuid)
-                sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
-                if 'attached_device_path' in sm_config:
-                    del sm_config['attached_device_path']
-                    self.sr.session.xenapi.VDI.set_sm_config(vdi_ref, sm_config)
-                    util.SMlog("Cleaned up device path from sm_config")
-            except Exception as e:
-                util.SMlog("Warning: Could not clean up device path from sm_config: %s" % str(e))
+            # Clean up the host-specific device path from sm_config
+            host_ref = self.sr.session.xenapi.host.get_by_uuid(util.get_this_host())
+            host_key = "host_%s_device_path" % host_ref
+            
+            # Use direct XAPI call to remove host-specific key
+            vdi_ref = self.sr.session.xenapi.VDI.get_by_uuid(self.uuid)
+            current_sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
+            if host_key in current_sm_config:
+                self.sr.session.xenapi.VDI.remove_from_sm_config(vdi_ref, host_key)
+                util.SMlog("Cleaned up device path for host %s from sm_config" % host_ref)
+            else:
+                util.SMlog("Device path key %s not found in sm_config, nothing to clean up" % host_key)
             
             util.SMlog("Unmapped RBD image %s from device %s" % (self.rbd_name, self.device_path))
             
