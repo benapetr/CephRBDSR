@@ -475,8 +475,13 @@ class CephRBDVDI(VDI.VDI):
     """Ceph RBD VDI implementation"""
     
     def __init__(self, sr, uuid):
-        # Default RBD-specific properties (for regular images)
+        # On first sight it may appear as this is identical to attached, but it's not, attached is a state when VDI is attached in XAPI
+        # Mapped is a state when RBD image is mapped in the kernel. Ideally these should be in sync, but in case of crashes or bugs they might differ
         self.mapped = False
+        # When the image is mapped we store the device to sm config so that when we need to detach it, we are referring to the correct device
+        # in theory you can map same RBD image multiple times and get different device paths, so we need to make sure we unmap the correct one
+        self.mapped_path_known = False
+        self.mapped_path = None
         self.snapshot_of = None
         self.is_protected = False
         self.is_a_snapshot = False
@@ -509,11 +514,19 @@ class CephRBDVDI(VDI.VDI):
             self.utilisation = int(self.sr.session.xenapi.VDI.get_physical_utilisation(vdi_ref))
             
             # Load sm_config to get RBD-specific information
-            sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
+            self.sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
+            
+            # Restore the device path if it was stored during attach
+            if 'attached_device_path' in self.sm_config:
+                self.attached = True
+                self.mapped = True
+                self.mapped_path_known = True
+                self.mapped_path = self.sm_config['attached_device_path']
+                util.SMlog("Restored mapped path from sm_config: %s" % self.mapped_path)
             
             # Extract snapshot name and RBD name from sm_config if it's a snapshot
             if self.is_a_snapshot:
-                snapshot_of_uuid = sm_config.get('snapshot_of', '')
+                snapshot_of_uuid = self.sm_config.get('snapshot_of', '')
                 snapshot_name = self.sr.SNAP_PREFIX + vdi_uuid
                 
                 if snapshot_of_uuid:
@@ -719,129 +732,38 @@ class CephRBDVDI(VDI.VDI):
             else:
                 raise xs_errors.XenError('VDIDelete', opterr='Failed to delete RBD image/snapshot: %s' % str(e))
     
-    def _resolve_device_path(self, path):
-        """Resolve device path, following symlinks to get the actual device"""
-        if not path:
-            return None
-            
-        try:
-            # If path exists and is a symlink, resolve it
-            if os.path.islink(path):
-                resolved = os.path.realpath(path)
-                util.SMlog("Resolved symlink %s -> %s" % (path, resolved))
-                return resolved
-            else:
-                return path
-        except Exception as e:
-            util.SMlog("Warning: Failed to resolve device path %s: %s" % (path, str(e)))
-            return path
-    
-    def _check_rbd_mapping(self):
-        """Check if this RBD image/snapshot is currently mapped and return device path"""
-        try:
-            cmd = ['rbd', 'showmapped', '--format', 'json']
-            output = util.pread2(cmd)
-            
-            if output.strip():
-                mapped_devices = json.loads(output)
-                
-                # For snapshots, we need to match both image name and snapshot name
-                if '@' in self.rbd_name:
-                    image_name, snap_name = self.rbd_name.split('@', 1)
-                    for device_info in mapped_devices:
-                        if (device_info.get('name') == image_name and 
-                            device_info.get('snap') == snap_name and
-                            device_info.get('pool') == self.sr.pool):
-                            device_path = device_info.get('device')
-                            util.SMlog("RBD snapshot %s is mapped to device %s" % (self.rbd_name, device_path))
-                            return device_path
-                else:
-                    # Regular image - match by name and ensure no snapshot
-                    for device_info in mapped_devices:
-                        if (device_info.get('name') == self.rbd_name and 
-                            device_info.get('snap') == '-' and  # No snapshot
-                            device_info.get('pool') == self.sr.pool):
-                            device_path = device_info.get('device')
-                            util.SMlog("RBD image %s is mapped to device %s" % (self.rbd_name, device_path))
-                            return device_path
-                        
-            util.SMlog("RBD image/snapshot %s is not currently mapped" % self.rbd_name)
-            return None
-            
-        except Exception as e:
-            util.SMlog("Warning: Failed to check RBD mapping status: %s" % str(e))
-            return None
-    
     def attach(self, sr_uuid, vdi_uuid):
         """Attach RBD image or snapshot - map to kernel device"""
         util.SMlog("Attaching CephRBD VDI %s" % self.uuid)
-        
-        # If we already have a device path tracked, verify it's still valid
-        if hasattr(self, 'device_path') and self.device_path and os.path.exists(self.device_path):
-            # Verify this device is actually our RBD image by checking showmapped
-            try:
-                cmd = ['rbd', 'showmapped', '--format', 'json']
-                output = util.pread2(cmd)
-                
-                if output.strip():
-                    mapped_devices = json.loads(output)
-                    
-                    for device_info in mapped_devices:
-                        if (device_info.get('device') == self.device_path and
-                            device_info.get('name') == self.rbd_name.split('@')[0] and  # Handle snapshots
-                            device_info.get('pool') == self.sr.pool):
-                            util.SMlog("VDI %s already mapped to tracked device %s" % (self.uuid, self.device_path))
-                            self.mapped = True
-                            self.path = self.device_path
-                            self.attached = True
-                            
-                            if not hasattr(self, 'xenstore_data'):
-                                self.xenstore_data = {}
-                            self.xenstore_data['storage-type'] = 'rbd'
-                            
-                            return VDI.VDI.attach(self, sr_uuid, vdi_uuid)
-                            
-            except Exception as e:
-                util.SMlog("Warning: Failed to verify existing device mapping: %s" % str(e))
-        
-        # Check if our RBD image/snapshot is mapped to any device
-        existing_device = self._check_rbd_mapping()
-        if existing_device and (not hasattr(self, 'device_path') or not self.device_path):
-            util.SMlog("VDI %s found mapped to %s (no specific device tracked)" % (self.uuid, existing_device))
-            self.device_path = existing_device
+
+        try:
+            # Map RBD image or snapshot to kernel device
+            # For snapshots, rbd_name will be in format "image@snap-name"
+            # For regular images, rbd_name will be just "image-name"
+            cmd = self.sr._build_rbd_cmd(['map', self.rbd_name])
+            
+            device = util.pread2(cmd).strip()
+            
+            # Verify device was created and is accessible
+            if not os.path.exists(device):
+                raise Exception("Mapped device not found: %s" % device)
+            
+            # Store the exact device path that was assigned to this VDI instance
+            self.device_path = device
             self.mapped = True
-        else:
-            try:
-                # Map RBD image or snapshot to kernel device
-                # For snapshots, rbd_name will be in format "image@snap-name"
-                # For regular images, rbd_name will be just "image-name"
-                cmd = self.sr._build_rbd_cmd(['map', self.rbd_name])
-                
-                device = util.pread2(cmd).strip()
-                
-                # Verify device was created and is accessible
-                if not os.path.exists(device):
-                    raise Exception("Mapped device not found: %s" % device)
-                
-                # Store the exact device path that was assigned to this VDI instance
-                self.device_path = device
-                self.mapped = True
-                
-                util.SMlog("Mapped RBD image %s to device %s" % (self.rbd_name, device))
-                
-            except Exception as e:
-                raise xs_errors.XenError('VDIUnavailable',
-                                       opterr='Failed to map RBD image: %s' % str(e))
+            
+            util.SMlog("Mapped RBD image %s to device %s" % (self.rbd_name, device))
+            
+        except Exception as e:
+            raise xs_errors.XenError('VDIUnavailable', opterr='Failed to map RBD image: %s' % str(e))
         
         # Set up path and xenstore data
         self.path = self.device_path
         self.attached = True
-        
-        if not hasattr(self, 'xenstore_data'):
-            self.xenstore_data = {}
-        
-        # Add any RBD-specific xenstore data here if needed
-        self.xenstore_data['storage-type'] = 'rbd'
+
+        # Store the device path in VDI sm_config for retrieval during detach
+        self.sm_config['attached_device_path'] = self.device_path
+        self._db_update()
         
         # Call base class attach which returns the proper XMLRPC struct
         return VDI.VDI.attach(self, sr_uuid, vdi_uuid)
@@ -850,77 +772,35 @@ class CephRBDVDI(VDI.VDI):
         """Detach RBD image - unmap kernel device"""
         util.SMlog("Detaching CephRBD VDI %s" % self.uuid)
         
-        device_to_unmap = None
-        
-        # First priority: use the exact device path that was assigned to this VDI instance
-        if hasattr(self, 'device_path') and self.device_path:
-            if os.path.exists(self.device_path):
-                # Resolve symlinks to get the actual device path for comparison
-                resolved_device_path = self._resolve_device_path(self.device_path)
-                
-                # Verify this device is actually our RBD image
-                try:
-                    cmd = ['rbd', 'showmapped', '--format', 'json']
-                    output = util.pread2(cmd)
-                    
-                    if output.strip():
-                        mapped_devices = json.loads(output)
-                        
-                        for device_info in mapped_devices:
-                            mapped_device = device_info.get('device')
-                            # Check if this device matches our image/snapshot
-                            if mapped_device == resolved_device_path:
-                                if '@' in self.rbd_name:
-                                    # For snapshots, match image name and snapshot name
-                                    image_name, snap_name = self.rbd_name.split('@', 1)
-                                    if (device_info.get('name') == image_name and
-                                        device_info.get('snap') == snap_name and
-                                        device_info.get('pool') == self.sr.pool):
-                                        device_to_unmap = self.device_path
-                                        util.SMlog("Using tracked device path for snapshot detach: %s (resolved: %s)" % 
-                                                  (device_to_unmap, resolved_device_path))
-                                        break
-                                else:
-                                    # For regular images, match image name and ensure no snapshot
-                                    if (device_info.get('name') == self.rbd_name and
-                                        device_info.get('snap') == '-' and
-                                        device_info.get('pool') == self.sr.pool):
-                                        device_to_unmap = self.device_path
-                                        util.SMlog("Using tracked device path for detach: %s (resolved: %s)" % 
-                                                  (device_to_unmap, resolved_device_path))
-                                        break
-                                
-                except Exception as e:
-                    util.SMlog("Warning: Failed to verify tracked device mapping: %s" % str(e))
-            else:
-                util.SMlog("Tracked device path %s no longer exists" % self.device_path)
-        
-        # Fallback: search for any mapping of our RBD image (only if we don't have a verified device)
-        if not device_to_unmap:
-            device_to_unmap = self._check_rbd_mapping()
-            if device_to_unmap:
-                util.SMlog("Found RBD image mapped to device: %s (fallback search)" % device_to_unmap)
-        
-        # If no device found, VDI is not currently mapped
-        if not device_to_unmap:
-            util.SMlog("VDI %s is not currently mapped" % self.uuid)
-            self.mapped = False
-            self.attached = False
-            return
-        
+        if not self.mapped_path_known:
+            # Show error here - we can't continue
+            raise xs_errors.XenError('VDINotAttached', opterr='VDI was not properly attached, cannot detach safely')
+
+        self.device_path = self.mapped_path
+
         try:
-            # Unmap the specific device we identified
-            cmd = self.sr._build_rbd_cmd(['unmap', device_to_unmap])
+            cmd = self.sr._build_rbd_cmd(['unmap', self.device_path])
             util.pread2(cmd)
             
             self.mapped = False
             self.attached = False
             
-            util.SMlog("Unmapped RBD image %s from device %s" % (self.rbd_name, device_to_unmap))
+            # Clean up the stored device path from sm_config
+            try:
+                vdi_ref = self.sr.session.xenapi.VDI.get_by_uuid(self.uuid)
+                sm_config = self.sr.session.xenapi.VDI.get_sm_config(vdi_ref)
+                if 'attached_device_path' in sm_config:
+                    del sm_config['attached_device_path']
+                    self.sr.session.xenapi.VDI.set_sm_config(vdi_ref, sm_config)
+                    util.SMlog("Cleaned up device path from sm_config")
+            except Exception as e:
+                util.SMlog("Warning: Could not clean up device path from sm_config: %s" % str(e))
+            
+            util.SMlog("Unmapped RBD image %s from device %s" % (self.rbd_name, self.device_path))
             
         except Exception as e:
             # Log warning but don't fail - device may have been unmapped already
-            util.SMlog("Warning: Failed to unmap RBD device %s: %s" % (device_to_unmap, str(e)))
+            util.SMlog("Warning: Failed to unmap RBD device %s: %s" % (self.device_path, str(e)))
     
     def snapshot(self, sr_uuid, vdi_uuid):
         """Create RBD snapshot (read-only)"""
