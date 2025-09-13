@@ -32,9 +32,7 @@ import vhdutil
 import os
 import json
 import time
-import subprocess
 import re
-import xmlrpclib
 import datetime
 from lock import Lock
 
@@ -66,7 +64,7 @@ CONFIGURATION = [
 # Driver metadata information
 DRIVER_INFO = {
     'name': 'Ceph RBD Storage',
-    'description': 'Ceph RADOS Block Device storage repository for distributed storage',
+    'description': 'Ceph RADOS Block Device storage repository that uses native kernel RBD driver',
     'vendor': 'Petr Bena <petr@bena.rocks>',
     'copyright': '(C) 2025 Petr Bena <petr@bena.rocks>',
     'driver_version': '1.0',
@@ -77,15 +75,15 @@ DRIVER_INFO = {
 
 # Driver-specific configuration
 DRIVER_CONFIG = {
-    "ATTACH_FROM_CONFIG_WITH_TAPDISK": False,  # We use kernel RBD mapping
-    "MULTIPATH": False  # Ceph is natively parallel
+    "ATTACH_FROM_CONFIG_WITH_TAPDISK": False  # We use kernel RBD mapping
 }
 
 class CephRBDSR(SR.SR):
     """Ceph RBD Storage Repository implementation"""
     
     DRIVER_TYPE = "cephrbd"
-    RBD_PREFIX = "vdi-"  # Prefix for RBD image names, there is also "conf.prefix" which is configurable and allows using same pool for multiple SRs with different prefixes
+    # Prefix for RBD image names, there is also separate additional prefix in "conf.prefix" which is configurable and allows using same pool for multiple SRs with different prefixes
+    RBD_PREFIX = "vdi-"
     SNAP_PREFIX = "snap-"
     
     def handles(type):
@@ -108,6 +106,10 @@ class CephRBDSR(SR.SR):
         self.keyring = self.dconf.get('keyring', '')
         self.mon_host = self.dconf.get('mon_host', '')
         self.prefix = self.dconf.get('prefix', '')
+
+        # If custom prefix is set and doesn't end with a hyphen, add one
+        if self.prefix and self.prefix != '' and not self.prefix.endswith('-'):
+            self.prefix += '-'
         
         # Validate Ceph configuration file exists
         if not os.path.exists(self.ceph_conf):
@@ -299,6 +301,8 @@ class CephRBDSR(SR.SR):
                     # Get current virtual allocation from XAPI and add delta
                     valloc = int(self.session.xenapi.SR.get_virtual_allocation(self.sr_ref))
                     self.virtual_allocation = valloc + virtAllocDelta
+                    if (self.virtual_allocation < 0):
+                        self.virtual_allocation = 0
                     util.SMlog("CephRBDSR._updateStats: XAPI virtual_allocation %d + delta %d = %d" % 
                                (valloc, virtAllocDelta, self.virtual_allocation))
                 except Exception as e:
@@ -307,6 +311,8 @@ class CephRBDSR(SR.SR):
                     if not hasattr(self, 'virtual_allocation'):
                         self.virtual_allocation = 0
                     self.virtual_allocation += virtAllocDelta
+                    if (self.virtual_allocation < 0):
+                        self.virtual_allocation = 0
                     util.SMlog("CephRBDSR._updateStats: local virtual_allocation + delta %d = %d" % 
                                (virtAllocDelta, self.virtual_allocation))
         
@@ -631,21 +637,6 @@ class CephRBDVDI(VDI.VDI):
         if hasattr(self, 'attached') and self.attached:
             raise xs_errors.XenError('VDIInUse', opterr='VDI is currently attached')
         
-        # Check if RBD image is mapped anywhere and try to unmap it
-        # This handles cases where the VDI was not properly detached (crashes, etc.)
-        try:
-            self._verify_mapping()
-
-            if (self.mapped):
-                try:
-                    cmd = self.sr._build_rbd_cmd(['unmap', self.device_path])
-                    util.pread2(cmd)
-                    util.SMlog("Successfully unmapped device %s" % self.device_path)
-                except Exception as e:
-                    util.SMlog("Warning: Failed to unmap device %s: %s" % (self.device_path, str(e)))
-        except Exception as e:
-            util.SMlog("Warning: Failed to check mapped devices: %s" % str(e))
-        
         # If this is a snapshot, check if it's protected
         if (self.is_a_snapshot):
             if (self.is_protected):
@@ -667,7 +658,6 @@ class CephRBDVDI(VDI.VDI):
                 util.SMlog("Warning: Failed to check for snapshots: %s" % str(e))
         
         try:
-            # Check if this VDI represents a snapshot (rbd_name contains @)
             if self.is_a_snapshot:
                 # This is a snapshot, unprotect and delete it
                 util.SMlog("Deleting RBD snapshot: %s" % self.rbd_name)
@@ -687,17 +677,8 @@ class CephRBDVDI(VDI.VDI):
                     util.SMlog("Unprotected snapshot: %s" % self.rbd_name)
                 except Exception as e:
                     # If unprotect fails, the snapshot might not be protected or might have children
-                    util.SMlog("Warning: Failed to unprotect snapshot %s: %s" % (self.rbd_name, str(e)))
-                    # Check if snapshot has children (clones)
-                    image_name, snap_name = self.rbd_name.split('@', 1)
-                    try:
-                        cmd = self.sr._build_rbd_cmd(['children', self.rbd_name])
-                        children = util.pread2(cmd)
-                        if children.strip():
-                            raise xs_errors.XenError('VDIInUse',
-                                                   opterr='Snapshot has children (clones), cannot delete: %s' % children.strip())
-                    except Exception:
-                        pass  # children command might fail if no children
+                    util.SMlog("Error: Failed to unprotect snapshot %s: %s" % (self.rbd_name, str(e)))
+                    raise xs_errors.XenError('VDIDelete', opterr='Failed to unprotect snapshot: %s' % str(e))
                 
                 # Delete the snapshot
                 cmd = self.sr._build_rbd_cmd(['snap', 'rm', '--image', self._parent_name(), '--snap', self.rbd_name])
@@ -708,10 +689,14 @@ class CephRBDVDI(VDI.VDI):
                 # This is a regular RBD image
                 util.SMlog("Deleting RBD image: %s" % self.rbd_name)
                 
-                # Delete the RBD image
-                cmd = self.sr._build_rbd_cmd(['rm', self.rbd_name])
-                util.pread2(cmd)
-                util.SMlog("Deleted RBD image: %s" % self.rbd_name)
+                try:
+                    # Delete the RBD image
+                    cmd = self.sr._build_rbd_cmd(['rm', self.rbd_name])
+                    util.pread2(cmd)
+                    util.SMlog("Deleted RBD image: %s" % self.rbd_name)
+                except Exception as e:
+                    util.SMlog("Error: Failed to delete RBD image %s: %s" % (self.rbd_name, str(e)))
+                    raise xs_errors.XenError('VDIDelete', opterr='Failed to delete RBD image: %s' % str(e))
             
             # Update SR allocation and statistics
             if self.uuid in self.sr.vdis:
@@ -1029,44 +1014,6 @@ class CephRBDVDI(VDI.VDI):
         if not self.attached and self.mapped:
             self.detach(sr_uuid, vdi_uuid)
     
-    def _verify_mapping(self):
-        # Check if RBD is mapped to block device, and if our internal mapping info is up-to-date
-        cmd = ['rbd', 'showmapped', '--format', 'json']
-        output = util.pread2(cmd)
-        
-        if output.strip():
-            mapped_devices = json.loads(output)
-            
-            # If we already have a specific device_path tracked, verify it's still valid
-            if hasattr(self, 'device_path') and self.device_path:
-                for device_info in mapped_devices:
-                    if (device_info.get('name') == self.rbd_name and device_info.get('pool') == self.sr.pool):
-                        if device_info.get('device') == self.device_path:
-                            self.mapped = True
-                            util.SMlog("Verified tracked device %s is still mapped for %s" % (self.device_path, self.rbd_name))
-                        else:
-                            util.SMlog("VDI %s expected at %s found at %s - updating mapping" % (self.rbd_name, self.device_path, device_info.get('device')))
-                            self.device_path = device_info.get('device')
-                            self.mapped = True
-                        return
-                        
-                # Our tracked device is no longer valid, clear it
-                util.SMlog("RBD for %s is not currently mapped (expected at %s)" % (self.rbd_name, self.device_path))
-                self.mapped = False
-            else:
-                # No specific device tracked, find any mapping (for initial discovery)
-                for device_info in mapped_devices:
-                    if (device_info.get('name') == self.rbd_name and 
-                        device_info.get('pool') == self.sr.pool):
-                        self.device_path = device_info.get('device', self.device_path)
-                        self.mapped = True
-                        util.SMlog("Discovered %s mapped to %s during scan" % (self.rbd_name, self.device_path))
-                        return
-                self.mapped = False
-        else:
-            # No mapped devices found
-            self.mapped = False
-
     def _load_from_rbd_info(self, rbd_info):
         """Load VDI properties from RBD ls output"""
         self.size = rbd_info.get('size', 0)
@@ -1080,15 +1027,6 @@ class CephRBDVDI(VDI.VDI):
             # Snapshots in CEPH are always read-only
             self.read_only = True
             self.parent_uuid = rbd_info['image']
-        
-        try:
-            self._verify_mapping()
-                
-        except Exception as e:
-            # If we can't determine mapping status, assume not mapped
-            util.SMlog("Warning: Failed to check mapping status for %s: %s" % (self.rbd_name, str(e)))
-            self.mapped = False
-
 
 # Register the driver with the SR framework
 if __name__ == '__main__':
