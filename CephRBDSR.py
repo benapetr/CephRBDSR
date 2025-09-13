@@ -23,6 +23,25 @@ providing distributed, scalable block storage with features like:
 - Live migration support
 """
 
+# Important notes:
+# Snapshot logic in this SM driver is imperfect at this moment, because the way snapshots are implemented in Xen
+# are fundamentally different from how snapshots work in CEPH, and sadly Xen API doesn't let the SM driver
+# implement this logic itself and instead forces its own (somewhat flawed and inefficient logic)
+
+# That means when the "revert to snapshot" is executed via admin UI - this driver is not notified about it in any way.
+# If it was, it would be able to execute a trivial "rbd rollback" CEPH action which would result in instant rollback
+
+# Instead Xen decides to create a clone from the snapshot by calling clone(), which creates another RBD
+# that is depending on parent snapshot, which is depending on original RBD image we wanted to rollback.
+# Then it calls delete on the original image which is parent of this entire new hierarchy.
+
+# This image is not impossible to delete, because it has a snapshot. Which means we need to perform a background
+# flatten operation, that performs physical 1:1 copy of entire image to the new clone and then destroys the snapshot
+# and original image.
+
+# This is brutally inefficient in comparison to native rollback (as in hours instead of seconds), but it seems with
+# current SM driver implementation it's not possible to do this efficiently, this requires a fix in SM API
+
 import SR
 import VDI
 import SRCommand
@@ -51,6 +70,7 @@ CAPABILITIES = [
     "THIN_PROVISIONING",     # RBD supports thin provisioning
     "VDI_READ_CACHING",      # Supports read caching
     "VDI_CONFIG_CBT",        # Supports changed block tracking via snapshots
+    "VDI_RESET_ON_BOOT/2",   # Supports snapshot rollback via reset_leaf
 ]
 
 # Configuration parameters required for Ceph RBD
@@ -886,94 +906,106 @@ class CephRBDVDI(VDI.VDI):
                 pass
             raise xs_errors.XenError('VDISnapshot', opterr='Failed to create RBD snapshot: %s' % str(e))
 
+    def _clone_rbd(self, image_name, snapshot_name, target_name):
+        """Helper function to clone RBD image from snapshot"""
+        try:
+            cmd = self.sr._build_rbd_cmd([
+                'clone', 
+                '--image',
+                image_name,
+                '--snap',
+                snapshot_name,
+                '--dest',
+                target_name
+            ])
+            util.pread2(cmd)
+            return True
+        except Exception as e:
+            raise xs_errors.XenError('VDIClone', opterr='Failed to create RBD clone: %s' % str(e))
+
     def clone(self, sr_uuid, vdi_uuid):
         """Clone VDI (create writable copy from snapshot)"""
         util.SMlog("Creating CephRBD clone from VDI %s" % self.uuid)
         
         # Generate new UUID for the clone
         clone_uuid = util.gen_uuid()
-        snapshot_uuid = util.gen_uuid()
-        util.SMlog("Generated new UUID for cloned VDI: %s using temp clone with UUID: %s" % (clone_uuid, snapshot_uuid))
-
         clone_name = "%s%s%s" % (self.sr.prefix, self.sr.RBD_PREFIX, clone_uuid)
-        snapshot_name = "%s%sclone-temp-%s" % (self.sr.prefix, self.sr.SNAPSHOT_PREFIX, snapshot_uuid)
+        source_image = None
+        snapshot_name = None
         
-        try:
-            # Create snapshot of current RBD image
-            cmd = self.sr._build_rbd_cmd(['snap', 'create', '%s@%s' % (self.rbd_name, snapshot_name)])
-            util.pread2(cmd)
-            
-            # Protect snapshot (required for cloning)
-            cmd = self.sr._build_rbd_cmd(['snap', 'protect', '%s@%s' % (self.rbd_name, snapshot_name)])
-            util.pread2(cmd)
-            
-            # Create clone from snapshot (this creates a new writable RBD image)
-            cmd = self.sr._build_rbd_cmd([
-                'clone', 
-                '%s@%s' % (self.rbd_name, snapshot_name),
-                clone_name
-            ])
-            util.pread2(cmd)
-            
-            # Create clone VDI object with the new UUID
-            clone_vdi = self.sr.vdi(clone_uuid)
-            clone_vdi.size = self.size
-            clone_vdi.vdi_type = self.vdi_type
-            clone_vdi.utilisation = 0  # Clone is thin-provisioned
-            clone_vdi.parent = self
-            clone_vdi.rbd_name = clone_name
-            
-            # Set additional VDI properties for proper database introduction
-            clone_vdi.location = clone_uuid
-            clone_vdi.read_only = False  # Clone is writable
-            clone_vdi.label = self.label + " (clone)"
-            clone_vdi.description = "Clone of " + self.description
-            clone_vdi.ty = "user"  # VDI type for XAPI
-            clone_vdi.shareable = False
-            clone_vdi.managed = True
-            clone_vdi.is_a_snapshot = False  # Clone is not a snapshot, it's a new VDI
-            clone_vdi.metadata_of_pool = ""
-            clone_vdi.snapshot_time = "19700101T00:00:00Z"
-            clone_vdi.snapshot_of = ""
-            clone_vdi.cbt_enabled = False
-            
-            # Initialize sm_config
-            if not hasattr(clone_vdi, 'sm_config'):
-                clone_vdi.sm_config = {}
-            clone_vdi.sm_config['vdi_type'] = self.vdi_type
-            # Mark the parent snapshot info in sm_config 
-            clone_vdi.sm_config['clone_of'] = self.uuid
-            clone_vdi.sm_config['parent_snapshot'] = "%s@%s" % (self.rbd_name, snapshot_name)
-            
-            # Introduce the new VDI to XAPI database
-            vdi_ref = clone_vdi._db_introduce()
-            util.SMlog("vdi_clone: introduced VDI: %s (%s)" % (vdi_ref, clone_uuid))
-            
-            # Add to SR with the new UUID
-            self.sr.vdis[clone_uuid] = clone_vdi
-            
-            util.SMlog("Created RBD clone: %s (UUID: %s)" % (clone_name, clone_uuid))
-            return clone_vdi.get_params()
-            
-        except Exception as e:
-            # Cleanup on failure
+        if (self.is_a_snapshot):
+            # This is already a snapshot - just make a new RBD from it
+            source_image = self._parent_name()
+            snapshot_name = self.rbd_name
+        else:
+            # This is a regular image - create a temporary snapshot and clone from it   
+            snapshot_uuid = util.gen_uuid()
+            util.SMlog("Requested clone of pure RBD image, creating temporary snap. Generated new UUID for cloned VDI: %s using temp clone with UUID: %s" % (clone_uuid, snapshot_uuid))
+            snapshot_name = "%s%sclone-temp-%s" % (self.sr.prefix, self.sr.SNAPSHOT_PREFIX, snapshot_uuid)
+        
             try:
-                # Remove clone if it was created
-                cmd = self.sr._build_rbd_cmd(['rm', clone_name])
+                # Create snapshot of current RBD image
+                cmd = self.sr._build_rbd_cmd(['snap', 'create', '%s@%s' % (self.rbd_name, snapshot_name)])
                 util.pread2(cmd)
-            except:
-                pass
                 
-            try:
-                # Unprotect and remove snapshot if it was created
-                cmd = self.sr._build_rbd_cmd(['snap', 'unprotect', '%s@%s' % (self.rbd_name, snapshot_name)])
+                # Protect snapshot (required for cloning)
+                cmd = self.sr._build_rbd_cmd(['snap', 'protect', '%s@%s' % (self.rbd_name, snapshot_name)])
                 util.pread2(cmd)
-                cmd = self.sr._build_rbd_cmd(['snap', 'rm', '%s@%s' % (self.rbd_name, snapshot_name)])
+                
+                # Create clone from snapshot (this creates a new writable RBD image)
+                cmd = self.sr._build_rbd_cmd([
+                    'clone', 
+                    '%s@%s' % (self.rbd_name, snapshot_name),
+                    clone_name
+                ])
                 util.pread2(cmd)
-            except:
-                pass
+                
+            except Exception as e:
+                raise xs_errors.XenError('VDIClone', opterr='Failed to create RBD clone: %s' % str(e))
             
-            raise xs_errors.XenError('VDIClone', opterr='Failed to create RBD clone: %s' % str(e))
+
+        if not self._clone_rbd(source_image, snapshot_name, clone_name):
+            raise xs_errors.XenError('VDIClone', opterr='Failed to create RBD clone from snapshot')
+            
+        # Create clone VDI object with the new UUID
+        clone_vdi = self.sr.vdi(clone_uuid)
+        clone_vdi.size = self.size
+        clone_vdi.vdi_type = self.vdi_type
+        clone_vdi.utilisation = 0  # Clone is thin-provisioned
+        clone_vdi.parent = self
+        clone_vdi.rbd_name = clone_name
+        
+        # Set additional VDI properties for proper database introduction
+        clone_vdi.location = clone_uuid
+        clone_vdi.read_only = False  # Clone is writable
+        clone_vdi.label = self.label + " (clone)"
+        clone_vdi.description = "Clone of " + self.description
+        clone_vdi.ty = "user"  # VDI type for XAPI
+        clone_vdi.shareable = False
+        clone_vdi.managed = True
+        clone_vdi.is_a_snapshot = False  # Clone is not a snapshot, it's a new VDI
+        clone_vdi.metadata_of_pool = ""
+        clone_vdi.snapshot_time = "19700101T00:00:00Z"
+        clone_vdi.snapshot_of = ""
+        clone_vdi.cbt_enabled = False
+        
+        # Initialize sm_config
+        if not hasattr(clone_vdi, 'sm_config'):
+            clone_vdi.sm_config = {}
+        clone_vdi.sm_config['vdi_type'] = self.vdi_type
+        # Mark the parent snapshot info in sm_config 
+        clone_vdi.sm_config['clone_of'] = self.uuid
+        clone_vdi.sm_config['parent_snapshot'] = "%s@%s" % (self.rbd_name, snapshot_name)
+        
+        # Introduce the new VDI to XAPI database
+        vdi_ref = clone_vdi._db_introduce()
+        util.SMlog("vdi_clone: introduced VDI: %s (%s)" % (vdi_ref, clone_uuid))
+        
+        # Add to SR with the new UUID
+        self.sr.vdis[clone_uuid] = clone_vdi
+        
+        util.SMlog("Created RBD clone: %s (UUID: %s)" % (clone_name, clone_uuid))
+        return clone_vdi.get_params()
     
     def resize(self, sr_uuid, vdi_uuid, size, online=False):
         """Resize RBD image"""
@@ -1014,6 +1046,48 @@ class CephRBDVDI(VDI.VDI):
             raise xs_errors.XenError('VDISize', opterr='Failed to resize RBD image: %s' % str(e))
         
         return VDI.VDI.get_params(self)
+    
+    def _rollback(self, image, snapshot):
+        """Internal helper to rollback RBD image to snapshot"""
+        try:
+            cmd = self.sr._build_rbd_cmd([
+                'snap', 'rollback',
+                '--image', image,
+                '--snap', snapshot
+            ])
+            util.pread2(cmd)
+            return True
+        except Exception as e:
+            util.SMlog("Error during rollback of %s to snapshot %s: %s" % (image, snapshot, str(e)))
+            return False
+    
+    def reset_leaf(self, sr_uuid, vdi_uuid):
+        """Reset VDI back to its parent snapshot state (rollback functionality)"""
+        util.SMlog("CephRBD.reset_leaf: rolling back VDI %s" % vdi_uuid)
+        
+        # Check if this VDI has a parent snapshot to revert to
+        parent_snapshot = self.sm_config.get('parent_snapshot', '')
+        if not parent_snapshot:
+            raise xs_errors.XenError('VDIRollback', opterr='VDI has no parent snapshot to revert to')
+        
+        # Safety check: VDI must not be attached during rollback
+        if hasattr(self, 'attached') and self.attached:
+            raise xs_errors.XenError('VDIInUse', opterr='Cannot rollback attached VDI')
+        
+        try:
+            # Use RBD rollback functionality to revert to snapshot
+            # This will reset the RBD image content back to the snapshot state
+            cmd = self.sr._build_rbd_cmd([
+                'snap', 'rollback',
+                '--image', self.rbd_name,
+                '--snap', parent_snapshot.split('@')[1]  # Extract snapshot name from full path
+            ])
+            util.pread2(cmd)
+            
+            util.SMlog("Successfully rolled back VDI %s to snapshot %s" % (vdi_uuid, parent_snapshot))
+            
+        except Exception as e:
+            raise xs_errors.XenError('VDIRollback', opterr='Failed to rollback RBD image: %s' % str(e))
     
     def activate(self, sr_uuid, vdi_uuid):
         """Activate VDI (ensure it's mapped)"""
