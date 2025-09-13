@@ -84,7 +84,7 @@ class CephRBDSR(SR.SR):
     DRIVER_TYPE = "cephrbd"
     # Prefix for RBD image names, there is also separate additional prefix in "conf.prefix" which is configurable and allows using same pool for multiple SRs with different prefixes
     RBD_PREFIX = "vdi-"
-    SNAP_PREFIX = "snap-"
+    SNAPSHOT_PREFIX = "snap-"
     
     def handles(type):
         """Check if this driver handles the given storage type"""
@@ -172,11 +172,8 @@ class CephRBDSR(SR.SR):
         # Verify Ceph connectivity
         self._test_ceph_connectivity()
         
-        # Update pool statistics
+        # Update pool statistics - this will call _db_update()
         self.stat(sr_uuid)
-        
-        # Scan for existing VDIs
-        self.scan(sr_uuid)
         
         util.SMlog("CephRBDSR attached successfully")
     
@@ -219,7 +216,7 @@ class CephRBDSR(SR.SR):
                         try:
                             if ('snapshot' in image_info):
                                 snapshot_id = image_info['snapshot']
-                                vdi_uuid = snapshot_id[len(self.prefix + self.SNAP_PREFIX):]
+                                vdi_uuid = snapshot_id[len(self.prefix + self.SNAPSHOT_PREFIX):]
                                 if (self._is_valid_uuid(vdi_uuid)):
                                     parent_id = image_info['image']
                                     vdi = self.vdi(vdi_uuid)
@@ -242,7 +239,13 @@ class CephRBDSR(SR.SR):
 
                         except Exception as e:
                             util.SMlog("Error loading VDI %s: %s" % (vdi_uuid, str(e)))
-                
+
+                    else:
+                        util.SMlog("Found unknown RBD image %s - does not match SR prefix, ignoring" % image_name)
+                        # Consider its size as it's also using space in the pool
+                        size = image_info.get('size', 0)
+                        self.virtual_allocation += size
+
                 util.SMlog("Scan complete: found %d VDIs, total allocation: %d" % (len(self.vdis), self.virtual_allocation))
             
         except Exception as e:
@@ -495,7 +498,7 @@ class CephRBDVDI(VDI.VDI):
         # Set VDI type - RBD provides raw block devices
         self.vdi_type = vhdutil.VDI_TYPE_RAW  # 'aio'
         if (self.is_a_snapshot):
-            self.rbd_name = "%s%s%s" % (sr.prefix, sr.SNAP_PREFIX, uuid)
+            self.rbd_name = "%s%s%s" % (sr.prefix, sr.SNAPSHOT_PREFIX, uuid)
             self.device_path = None
         else:
             self.rbd_name = "%s%s%s" % (sr.prefix, sr.RBD_PREFIX, uuid)
@@ -540,7 +543,7 @@ class CephRBDVDI(VDI.VDI):
             # Extract snapshot name and RBD name from sm_config if it's a snapshot
             if self.is_a_snapshot:
                 snapshot_of_uuid = self.sm_config.get('snapshot_of', '')
-                snapshot_name = self.sr.SNAP_PREFIX + vdi_uuid
+                snapshot_name = self.sr.SNAPSHOT_PREFIX + vdi_uuid
                 
                 if snapshot_of_uuid:
                     # For snapshots, rbd_name is parent_image@snapshot_name
@@ -806,14 +809,19 @@ class CephRBDVDI(VDI.VDI):
             util.SMlog("Warning: Failed to unmap RBD device %s: %s" % (self.device_path, str(e)))
     
     def snapshot(self, sr_uuid, vdi_uuid):
-        """Create RBD snapshot (read-only)"""
+        """Create VDI snapshot"""
+        # Note - CEPH snapshots are always read-only, if you want a writable copy, it's necessary to create a clone from the snapshot
         util.SMlog("Creating CephRBD snapshot from VDI %s" % self.uuid)
+
+        # We don't (yet) support snapshotting of snapshots
+        if (self.is_a_snapshot):
+            raise xs_errors.XenError('VDISnapshot', opterr='Cannot snapshot a snapshot')
         
         # Generate new UUID for the snapshot
         snapshot_uuid = util.gen_uuid()
         util.SMlog("Generated new UUID for snapshot: %s" % snapshot_uuid)
 
-        snapshot_name = "snap-%s" % snapshot_uuid
+        snapshot_name = "%s%s%s" % (self.sr.prefix, self.sr.SNAPSHOT_PREFIX, snapshot_uuid)
         
         try:
             # Create snapshot of current RBD image
@@ -876,20 +884,19 @@ class CephRBDVDI(VDI.VDI):
                 util.pread2(cmd)
             except:
                 pass
-            
-            raise xs_errors.XenError('VDISnapshot',
-                                   opterr='Failed to create RBD snapshot: %s' % str(e))
-    
+            raise xs_errors.XenError('VDISnapshot', opterr='Failed to create RBD snapshot: %s' % str(e))
+
     def clone(self, sr_uuid, vdi_uuid):
         """Clone VDI (create writable copy from snapshot)"""
         util.SMlog("Creating CephRBD clone from VDI %s" % self.uuid)
         
         # Generate new UUID for the clone
         clone_uuid = util.gen_uuid()
-        util.SMlog("Generated new UUID for clone: %s" % clone_uuid)
+        snapshot_uuid = util.gen_uuid()
+        util.SMlog("Generated new UUID for cloned VDI: %s using temp clone with UUID: %s" % (clone_uuid, snapshot_uuid))
 
         clone_name = "%s%s%s" % (self.sr.prefix, self.sr.RBD_PREFIX, clone_uuid)
-        snapshot_name = "snap-clone-%s" % clone_uuid
+        snapshot_name = "%s%sclone-temp-%s" % (self.sr.prefix, self.sr.SNAPSHOT_PREFIX, snapshot_uuid)
         
         try:
             # Create snapshot of current RBD image
@@ -966,28 +973,31 @@ class CephRBDVDI(VDI.VDI):
             except:
                 pass
             
-            raise xs_errors.XenError('VDIClone',
-                                   opterr='Failed to create RBD clone: %s' % str(e))
+            raise xs_errors.XenError('VDIClone', opterr='Failed to create RBD clone: %s' % str(e))
     
     def resize(self, sr_uuid, vdi_uuid, size, online=False):
         """Resize RBD image"""
-        util.SMlog("Resizing CephRBD VDI %s from %d to %d (online=%s)" % 
-                   (vdi_uuid, self.size, size, online))
-        
-        if size < self.size:
-            raise xs_errors.XenError('VDIShrink',
-                                   opterr='Cannot shrink RBD images')
+        util.SMlog("Resizing CephRBD VDI %s from %d to %d (online=%s)" % (vdi_uuid, self.size, size, online))
         
         if size == self.size:
-            return
+            return VDI.VDI.get_params(self)
         
         try:
-            # Resize RBD image
-            cmd = self.sr._build_rbd_cmd([
-                'resize',
-                '--size', str(size // (1024 * 1024)),  # RBD uses MB
-                self.rbd_name
-            ])
+            cmd = None
+            if size < self.size:
+                 cmd = self.sr._build_rbd_cmd([
+                    'resize',
+                    '--allow-shrink',
+                    '--size', str(size // (1024 * 1024)),  # RBD uses MB
+                    self.rbd_name
+                ])
+            else:
+                # Resize RBD image
+                cmd = self.sr._build_rbd_cmd([
+                    'resize',
+                    '--size', str(size // (1024 * 1024)),  # RBD uses MB
+                    self.rbd_name
+                ])
             
             util.pread2(cmd)
             
@@ -996,12 +1006,14 @@ class CephRBDVDI(VDI.VDI):
             self.size = size
             size_delta = size - old_size
             self.sr._updateStats(sr_uuid, size_delta)
+            self._db_update()
             
             util.SMlog("Resized RBD image %s to %d bytes" % (self.rbd_name, size))
             
         except Exception as e:
-            raise xs_errors.XenError('VDISize',
-                                   opterr='Failed to resize RBD image: %s' % str(e))
+            raise xs_errors.XenError('VDISize', opterr='Failed to resize RBD image: %s' % str(e))
+        
+        return VDI.VDI.get_params(self)
     
     def activate(self, sr_uuid, vdi_uuid):
         """Activate VDI (ensure it's mapped)"""
