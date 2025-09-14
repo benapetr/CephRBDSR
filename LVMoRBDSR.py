@@ -50,8 +50,8 @@ CONFIGURATION = [
 DRIVER_INFO = {
     'name': 'LVHD over Ceph RBD',
     'description': 'SR plugin which represents disks as Logical Volumes within a Volume Group created on a Ceph RBD image',
-    'vendor': 'Community',
-    'copyright': '(C) 2024',
+    'vendor': 'Petr Bena <petr@bena.rocks>',
+    'copyright': '(C) 2025 Petr Bena <petr@bena.rocks>',
     'driver_version': '1.0',
     'required_api_version': '1.0',
     'capabilities': CAPABILITIES,
