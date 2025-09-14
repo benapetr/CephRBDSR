@@ -2,15 +2,22 @@
 
 NOTE: This code is still work in progress - don't use in production yet
 
-SMAPIv2 storage driver that enables XCP-ng to use Ceph RADOS Block Device (RBD) images as virtual disk storage, providing distributed, scalable, and highly available block storage.
+SMAPIv1 storage drivers that enables XCP-ng to use Ceph RADOS Block Device (RBD) images as virtual disk storage, providing distributed, scalable, and highly available block storage.
+
+This repository contains 2 SM drivers: CephRBDSR and LVMoRBD
+
+CephRBDSR is an attempt to bring native RBD support to XCP-ng, allowing each VM to have disks provisioned as individual RBD images utilizing all low-level
+storage features of CEPH (fast snapshots, easy backups, etc.)
+
+LVMoRBD is a wrapper SR driver that is meant to simplify creation of LVMSR on top of RBD image.
 
 ## Features
 
-- **SMAPIv2 Compliance**: Full integration with XCP-ng's Storage Manager framework
+- **SMAPIv1 Compliance**: Full integration with XCP-ng's Storage Manager framework
 - **Thin Provisioning**: Efficient space utilization with Ceph's thin provisioning
 - **High Availability**: Leverages Ceph's distributed architecture and replication
 - **Live Operations**: Support for online resize, snapshots, and cloning
-- **Pool Quota Support**: Respects Ceph pool quotas when configured
+- **Pool Quota Support**: Respects Ceph pool quotas when configured (CephRBDSR works with pool quotas, LVMoRBD uses RBD image as total capacity reference)
 - **XCP-ng Compatibility**: Optimized for XCP-ng's Nautilus-era kernel
 - **Robust Error Handling**: Comprehensive error handling and recovery
 - **Statistics Tracking**: Real-time pool usage and capacity reporting
@@ -44,13 +51,17 @@ SMAPIv2 storage driver that enables XCP-ng to use Ceph RADOS Block Device (RBD) 
 ### 1. Install Ceph Client Tools
 
 ```bash
-# Install Ceph repository
-wget -q -O- 'https://download.ceph.com/keys/release.asc' | apt-key add -
-echo deb https://download.ceph.com/debian-nautilus/ $(lsb_release -sc) main | tee /etc/apt/sources.list.d/ceph.list
-apt-get update
+# Install Ceph repository (on dom0)
+/etc/yum.repos.d/ceph.repo:
+
+[ceph]
+name=CEPH
+baseurl=https://download.ceph.com/rpm-nautilus/el7/x86_64/
+enabled=1
+gpgcheck=0
 
 # Install Ceph client
-apt-get install ceph-common
+yum install ceph-common
 ```
 
 ### 2. Configure Ceph Authentication
@@ -144,19 +155,19 @@ When a quota is set, XCP-ng will show the quota size as the total SR capacity in
 
 ### Component Overview
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   XCP-ng Host   │    │   Ceph Cluster   │    │   RBD Images    │
-│                 │    │                  │    │                 │
-│  ┌──────────────┤    │  ┌─────────────┐ │    │ ┌─────────────┐ │
-│  │ XAPI/SMAPI   │    │  │   Monitor   │ │    │ │ vdi-uuid-1  │ │
-│  └──────────────┤    │  └─────────────┘ │    │ └─────────────┘ │
-│  ┌──────────────┤    │  ┌─────────────┐ │    │ ┌─────────────┐ │
-│  │ CephRBDSR.py │◄──►│  │     OSD     │ │◄──►│ │ vdi-uuid-2  │ │
-│  └──────────────┤    │  └─────────────┘ │    │ └─────────────┘ │
-│  ┌──────────────┤    │  ┌─────────────┐ │    │ ┌─────────────┐ │
-│  │   /dev/rbd0  │    │  │     OSD     │ │    │ │ vdi-uuid-n  │ │
-│  └──────────────┘    │  └─────────────┘ │    │ └─────────────┘ │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
+┌──────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   XCP-ng Host    │    │   Ceph Cluster   │    │   RBD Images    │
+│                  │    │                  │    │                 │
+│  ┌─────────────┐ │    │  ┌─────────────┐ │    │ ┌─────────────┐ │
+│  │ XAPI/SMAPI  │ │    │  │   Monitor   │ │    │ │ vdi-uuid-1  │ │
+│  └─────────────┘ │    │  └─────────────┘ │    │ └─────────────┘ │
+│  ┌─────────────┐ │    │  ┌─────────────┐ │    │ ┌─────────────┐ │
+│  │ CephRBDSR.py│ │◄──►│  │     OSD     │ │◄──►│ │ vdi-uuid-2  │ │
+│  └─────────────┘ │    │  └─────────────┘ │    │ └─────────────┘ │
+│  ┌─────────────┐ │    │  ┌─────────────┐ │    │ ┌─────────────┐ │
+│  │   /dev/rbd0 │ │    │  │     OSD     │ │    │ │ vdi-uuid-n  │ │
+│  └─────────────┘ │    │  └─────────────┘ │    │ └─────────────┘ │
+└──────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
 ### Storage Flow
@@ -178,28 +189,6 @@ auth_client_required = cephx
 
 [client.admin]
 keyring = /etc/ceph/ceph.client.admin.keyring
-```
-
-### Performance Tuning
-```bash
-# Optimize RBD for virtualization workloads
-ceph osd pool set rbd size 3
-ceph osd pool set rbd min_size 2
-ceph osd pool set rbd crush_rule replicated_rule
-
-# Enable RBD exclusive locks and object map (if supported)
-ceph osd pool application enable rbd rbd
-```
-
-### Multi-Pool Setup
-Create multiple SRs for different storage tiers:
-
-```bash
-# SSD pool for high-performance VMs
-xe sr-create type=cephrbd name-label="Ceph SSD" device-config:pool=ssd-pool
-
-# HDD pool for bulk storage
-xe sr-create type=cephrbd name-label="Ceph HDD" device-config:pool=hdd-pool
 ```
 
 ## Monitoring and Troubleshooting
@@ -264,8 +253,10 @@ ceph osd pool stats rbd
 ## Development
 
 ### Code Structure
+
+#### CephRBDSR.py - Direct RBD Driver
 ```
-CephRBDSR.py           # Main driver implementation
+CephRBDSR.py           # Direct RBD driver implementation
 ├── CephRBDSR          # SR (Storage Repository) class
 │   ├── create()       # Create/attach SR
 │   ├── delete()       # Delete/detach SR  
@@ -280,6 +271,33 @@ CephRBDSR.py           # Main driver implementation
     └── resize()       # Resize RBD image
 ```
 
+#### LVMoRBDSR.py - LVHD over RBD Driver
+```
+LVMoRBDSR.py           # LVHD over RBD driver implementation  
+├── LVMoRBDSR          # SR class (inherits from LVHDSR)
+│   ├── create()       # Create RBD image and LVM VG
+│   ├── delete()       # Delete LVM VG and RBD image
+│   ├── attach()       # Map RBD and activate LVM
+│   ├── detach()       # Deactivate LVM and unmap RBD
+│   ├── scan()         # Scan LVM with RBD-aware config
+│   ├── probe()        # Probe existing LVM on RBD
+│   ├── _map_rbd_image()     # RBD mapping operations
+│   ├── _unmap_rbd_image()   # RBD unmapping operations
+│   ├── _with_rbd_lvm_conf() # LVM config override
+│   ├── _deactivate_vg()     # VG deactivation
+│   ├── _export_vg()         # VG export for cleanup
+│   └── _parse_size_with_units() # Size parsing (M/G/T)
+└── LVMoRBDVDI         # VDI class (inherits from LVHDVDI)
+    ├── generate_config()      # VDI configuration
+    └── attach_from_config()   # Config-based attach
+```
+
+#### Key Architectural Differences
+- **CephRBDSR**: Each VDI is a separate RBD image, providing native Ceph features
+- **LVMoRBDSR**: Single RBD image contains LVM volume group, VDIs are logical volumes
+- **LVMoRBDSR** includes RBD device type support in LVM configuration (`/etc/lvm/lvmorbd/`)
+- **LVMoRBDSR** uses `LVM_SYSTEM_DIR` environment variable for RBD-aware LVM operations
+
 ## Contributing
 
 1. Fork the repository
@@ -292,7 +310,7 @@ CephRBDSR.py           # Main driver implementation
 - Follow existing code style and patterns
 - Test changes thoroughly in a lab environment
 - Update documentation for new features
-- Ensure compatibility with XCP-ng SMAPIv2 requirements
+- Ensure compatibility with XCP-ng SMAPIv1 requirements
 
 ## License
 
